@@ -1,0 +1,1002 @@
+"""钓鱼主循环 —— 严格复刻 Source/FishingFunBot/Bot/FishBot.cs（210 行）
+
+关键点（一个都不能省，省了就「只抛竿不拾取」）：
+  · PressKey(castKey) 之后必须 Watch(2000) 收敛基准
+  · WaitForBite() 用 FindBobber() 找到的「抛竿位置」做 biteWatcher.Reset
+    这个位置整竿固定，Loot 就传它（不是咬钩瞬间坐标）
+  · Watch() 里只做 bobberFinder.Find()，不做别的（不要加命中率统计）
+  · 超时 25 秒 / 检查间隔 25ms
+"""
+
+import time
+
+from .timedaction import TimedAction
+
+# 原版 ConsoleKey 枚举里 0x34='4'、0x35='5'、0x20=Space
+VK_SPACE = 0x20
+VK_4 = 0x34
+VK_5 = 0x35
+
+
+class FishingBot:
+    def __init__(self, bobber_finder, bite_watcher, cast_key=VK_4,
+                 ten_min_key=None, wow_process=None, log=None, grabber=None):
+        self.bobber_finder = bobber_finder
+        self.bite_watcher = bite_watcher
+        self.cast_key = cast_key
+        self.ten_min_key = list(ten_min_key or [])
+        self.wow_process = wow_process
+        self.log = log or (lambda *a, **k: None)
+        self.bobber_finder.grabber = grabber
+        self.is_enabled = False
+        self.start_time = time.monotonic()
+        self._rng = __import__("random").Random()
+        self.anchor_wait = 1.5      # 非原版：找锚点最多等这么久，超时立刻重抛
+        self.fishing_event_handler = lambda e: None
+        self.loot_reader = None     # 非原版：拾取后读「你获得了物品：[xxx]」
+        self._loot_fp = ""          # 上一竿结束时的物品提示指纹
+        self.loot_stats = {}        # 物品名 → 数量
+        # 非原版：收竿后检测屏幕上方的「没有鱼上钩」系统提示。
+        # 出现 = 收竿过早/误判咬钩（用户实测：时机对了每次都能钓到）。
+        self.no_bite_detector = None
+        self.miss_count = 0         # 误判（没有鱼上钩）竿数
+        # v17 诊断：收集本轮真实分布，用于确定门槛，不改变判定行为
+        self._diag = {"conf": [], "noanchor": [], "nobite": [], "own": {}, "prehit": 0}
+        self.hit_count = 0          # 真咬钩竿数
+        # 非原版调试（--debug=1）：每竿存 咬钩前/拾取后 两帧到 debug/，用于事后对比
+        self.debug_frames = False
+        self._cast_no = 0           # 本竿序号
+        self._debug_dir = "debug"
+        # v21：咬钩幅度自动标定（只做一次，需显式开启）
+        self.calib_sink = False
+        self._sink_calibrated = False
+        self.sink_calib_seconds = 17
+        self._area_armed_done = False   # 首竿标定截屏边界只做一次
+
+    # ---- 非原版：首竿标定截屏边界 ----
+    def _arm_screen_area(self):
+        """第一次抛竿后量一次截屏边界，之后永久沿用（用户设计）。
+
+        抛竿瞬间绿条要过几帧才画出来，所以这里稍等再量；量到后锁定，
+        后续所有帧用同一个区域 —— 帧尺寸一致，差分标定/序列定位才不会失效。
+        """
+        if self._area_armed_done:
+            return
+        screen = getattr(self.bobber_finder, "screen", None)
+        if screen is None or not hasattr(screen, "arm_area"):
+            return
+        time.sleep(0.6)                       # 等绿条画出来
+        area = screen.arm_area()              # 测一次 → 锁定
+        self._area_armed_done = True
+        if area:
+            self.log("锁定截屏区（首竿标定）: %dx%d@%d,%d", area[2], area[3], area[0], area[1])
+
+    # ---- 逐行对应 FishBot.cs:38-69 ----
+    def start(self):
+        self.is_enabled = True
+        self._do_ten_minute_key()
+
+        while self.is_enabled:
+            try:
+                self._cast_no += 1
+                self.log("Pressing key %s to Cast.", self.cast_key)
+                # 非原版：抛竿前先把光标停到屏幕右下角，避免鼠标悬停在抛竿点附近
+                # 挡住浮标 / 弹出悬停提示干扰 tan 判定
+                try:
+                    if hasattr(self.wow_process, "park_cursor"):
+                        self.wow_process.park_cursor()
+                except Exception:
+                    pass
+                self._press_ten_min_key_if_due()
+                self.fishing_event_handler({"Action": "Cast"})
+                # v20：抛竿前抓 pre（此刻画面里还没有浮标），抛竿后 2 秒
+                # 由 _watch 抓 post，两帧差分就能拿到浮标位置和真实色值。
+                self._grab_calib_pre()
+                self.wow_process.press_key(self.cast_key)
+
+                # 第一次抛竿后：绿条出现，此刻才量边界，量一次就永久锁定。
+                # 抛竿前画面里没有绿条/浮标，那时量出来的边界是错的
+                # （实测会量成 1280x172，把水面砍掉一大半，然后锁死）。
+                self._arm_screen_area()
+
+                self._watch(2000)          # ← 原版 FishBot.cs:57，不能省
+
+                # v21：第一竿抛竿后采 17 秒，实测本钓点浮标下沉幅度，
+                # 反推 strike_value。只做一次，之后所有竿沿用。
+                self._maybe_calibrate_sink()
+
+                self._wait_for_bite()
+            except Exception as e:
+                self.log("ERR %s", e)
+                time.sleep(2.0)
+
+        self.log("Bot has Stopped.")
+
+    def stop(self):
+        self.is_enabled = False
+        total = self.hit_count + self.miss_count
+        if total > 0:
+            rate = 100.0 * self.hit_count / total
+            self.log("收竿统计: 总计 %d 竿 | 真咬钩 %d | 没有鱼上钩(误判) %d | 准确率 %.1f%%",
+                     total, self.hit_count, self.miss_count, rate)
+        # 诊断(v17)：汇总本轮所有 DIAG 数据，用于定门槛
+        try:
+            self._diag_summary()
+        except Exception as e:
+            self.log("DIAG汇总失败: %s", e)
+        self.log("Bot is Stopping...")
+
+    def _diag_summary(self):
+        """v17 诊断汇总：把本轮收集的可信度/找锚点/黄字分布打出来。"""
+        d = getattr(self, "_diag", None) or {}
+        conf = d.get("conf", [])
+        if conf:
+            s = sorted(conf)
+            n = len(s)
+            self.log("DIAG汇总 可信度 n=%d min=%.2f p25=%.2f 中位=%.2f p75=%.2f max=%.2f",
+                     n, s[0], s[int(n * 0.25)], s[n // 2], s[int(n * 0.75)], s[-1])
+            for th in (0.30, 0.35, 0.40, 0.45):
+                ok = sum(1 for x in s if x >= th)
+                self.log("DIAG汇总 门槛%.2f 通过 %d/%d = %.0f%%", th, ok, n, 100.0 * ok / n)
+            self.log("DIAG汇总 v18 生效门槛=%.2f（低于此值放弃重抛）",
+                     getattr(self, "anchor_ratio_min", 0.35))
+        na = d.get("noanchor", [])
+        if na:
+            self.log("DIAG汇总 找锚点失败 %d 次，退出原因: %s", len(na), na)
+        nb = d.get("nobite", [])
+        if nb:
+            self.log("DIAG汇总 黄字检测 %d 次，命中 %d 次；峰值 px=%s rows=%s span=%s",
+                     len(nb), sum(1 for x in nb if x[0]),
+                     [x[1] for x in nb], [x[2] for x in nb], [x[3] for x in nb])
+        own = d.get("own", {})
+        if own:
+            self.log("DIAG汇总 归属: 真咬钩=%d 误判=%d 被基准吞=%d",
+                     own.get("hit", 0), own.get("miss", 0), own.get("eaten", 0))
+        pre = d.get("prehit", 0)
+        self.log("DIAG汇总 收竿前已有黄字的竿数=%d（这些竿的误判会被吞）", pre)
+
+    # ---- v20 新增：差分标定的取帧 ----
+    def _grab_calib_pre(self):
+        """抛竿前抓 pre 帧。抓不到就置 None，退化为原版纯色阈值逻辑。"""
+        bf = self.bobber_finder
+        if not hasattr(bf, "calib_pre"):
+            return
+        if not getattr(bf, "calib_enabled", True):
+            return
+        try:
+            # v20.1 修正：原来错调 self.wow_process.grab()，但 wow_process 是
+            # 窗口/键盘对象，根本没有 grab —— 每竿都报"pre 帧抓取失败"，
+            # 差分标定等于从未启动。真正的截图入口是注入给 finder 的
+            # grabber（WowScreen），_watch 里也是走这条路。
+            grabber = getattr(bf, "grabber", None)
+            pre = grabber.grab() if grabber is not None else None
+            bf.calib_pre = pre
+            bf._calib_bmp = None
+            if pre is None:
+                self.log("差分标定: pre 帧抓取失败，本竿退回色阈逻辑")
+            elif getattr(self, "debug_frames", False):
+                try:
+                    import os
+                    self._dump_bmp(pre, "calib_pre")
+                except Exception as e:
+                    self.log("差分标定: pre 落盘失败 %s", e)
+        except Exception as e:
+            bf.calib_pre = None
+            self.log("差分标定: pre 帧异常 %s，本竿退回色阈逻辑", e)
+
+    def _dump_bmp(self, bmp, tag):
+        """把一帧存成 bmp，用于事后验证差分标定是否真的对得上。"""
+        import os
+        from PIL import Image
+        os.makedirs("debug", exist_ok=True)
+        fn = os.path.join("debug", "%s_%s.bmp"
+                          % (tag, time.strftime("%H%M%S")))
+        Image.fromarray(bmp).save(fn)
+        self.log("差分标定: 已存 %s", fn)
+
+    def dump_frame_pair(self, tag, index=0):
+        """v36：同时存「全屏」+「截屏区」两张图，用于离线复盘。
+
+        为什么要全屏：只存截屏区时，无法判断检测算出的坐标到底对应屏幕上
+        哪个东西 —— 之前十几个版本全在这个盲区里猜。
+
+        文件名形如 帧01_全屏_t1.0s.bmp / 帧01_区域_1280x911@640,244_t1.0s.bmp，
+        坐标与区域尺寸直接写进文件名，拿到图就能对号入座。
+        """
+        import os
+        from PIL import Image
+        outdir = "debug"
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except Exception:
+            return
+        ts = time.strftime("%H%M%S")
+        # 1) 截屏区
+        l = t = 0
+        cw = ch = 0
+        try:
+            g = getattr(self.bobber_finder, "grabber", None)
+            if g is not None:
+                l, t, cw, ch = g.search_area()
+        except Exception:
+            pass
+        try:
+            bmp = None
+            g = getattr(self.bobber_finder, "grabber", None)
+            if g is not None:
+                bmp = g.grab()
+            if bmp is not None:
+                fn = os.path.join(
+                    outdir, "帧%02d_区域_%dx%d@%d,%d_%s.bmp"
+                    % (index, bmp.shape[1], bmp.shape[0], l, t, ts))
+                Image.fromarray(bmp).save(fn)
+        except Exception as e:
+            self.log("存区域帧失败 %s", e)
+        # 2) 全屏（含 UI，用于人工核对浮标在屏幕上的真实位置）
+        try:
+            import mss
+            import numpy as np
+            with mss.mss() as sct:
+                mon = sct.monitors[1]
+                raw = sct.grab(mon)
+            arr = np.frombuffer(bytes(raw.raw), np.uint8)
+            arr = arr.reshape(raw.height, raw.width, 4)[:, :, 2::-1]
+            arr = np.ascontiguousarray(arr)
+            fn = os.path.join(
+                outdir, "帧%02d_全屏_%dx%d_%s.bmp"
+                % (index, arr.shape[1], arr.shape[0], ts))
+            Image.fromarray(arr).save(fn)
+        except Exception as e:
+            self.log("存全屏帧失败 %s", e)
+
+    def _dump_confirm(self, bmp, tag, note, boxes=None):
+        """存一张「需要人工确认」的截图，文件名自带说明。
+
+        用户部署后跑一竿，就能凭 debug/ 里的图核对：
+          - 排除区（左右 1/7、下方 1/4、天空分界线）画得对不对
+          - 浮标真实位置在不在保留区里
+          - 序列定位框住的是浮标还是整屏
+
+        boxes: [(x0,y0,x1,y1,color_name), ...] 会在图上描边，
+               颜色 红=找到的浮标 蓝=排除参考线 黄=候选。
+        """
+        import os
+        from PIL import Image, ImageDraw
+        d = os.path.join(os.getcwd(), "debug")
+        os.makedirs(d, exist_ok=True)
+        img = Image.fromarray(bmp).convert("RGB")
+        draw = ImageDraw.Draw(img)
+        palette = {"red": (255, 40, 40), "blue": (40, 140, 255),
+                   "yellow": (255, 220, 0), "green": (40, 240, 120)}
+        order = {"blue": 0, "green": 1, "yellow": 2, "red": 3}
+        for bx in sorted((boxes or []), key=lambda b: order.get(b[4], 0)):
+            x0, y0, x1, y1, cname = bx[0], bx[1], bx[2], bx[3], bx[4]
+            col = palette.get(cname, (255, 255, 255))
+            if y0 == y1:                       # 纯水平线（分界线），rectangle 画不出来
+                draw.line([(x0, y0), (x1, y1)], fill=col, width=2)
+            elif x0 == x1:                     # 纯垂直线
+                draw.line([(x0, y0), (x1, y1)], fill=col, width=2)
+            else:
+                draw.rectangle([x0, y0, x1, y1], outline=col, width=2)
+        safe = "".join(ch for ch in note if ch not in '\\/:*?"<>|')[:28]
+        fn = os.path.join(d, "%s_%s_%s.bmp"
+                          % (time.strftime("%H%M%S"), tag, safe))
+        try:
+            img.save(fn)
+            self.log("需确认截图: %s", fn)
+        except Exception as e:
+            self.log("需确认截图写失败 %s", e)
+            return None
+        return fn
+
+    def _boxes_for_zones(self, bmp, extra=None):
+        """按当前 finder 的排除参数生成描边框（蓝色参考线）。"""
+        h, w = bmp.shape[0], bmp.shape[1]
+        bf = self.bobber_finder
+        sx = int(w * getattr(bf, "exclude_side_ratio", 1.0 / 7.0))
+        by = int(h * (1.0 - getattr(bf, "exclude_bottom_ratio", 0.25)))
+        lim = getattr(bf, "sky_limit_y", None)
+        top = int(lim) if lim is not None else 0
+        boxes = [(0, 0, max(sx - 1, 0), h - 1, "blue"),
+                 (w - sx, 0, w - 1, h - 1, "blue"),
+                 (0, by + 1, w - 1, h - 1, "blue"),
+                 (0, top, w - 1, top, "yellow")]
+        if lim is not None:
+            boxes.append((0, 0, w - 1, top, "blue"))
+        return boxes + list(extra or [])
+
+    def _maybe_calibrate_sink(self):
+        """v21：第一竿抛竿后跑一次 17 秒采样，标定咬钩下沉幅度。
+
+        为什么要标定：strike_value 是绝对像素数。写死 4 的时候，水面
+        波纹 ±2~4px 的常规浮动就足以触发判定 —— 日志实测每次「咬钩」
+        都是 yDiff=-4，且都在开始监控后 2 秒内，那是波纹不是鱼。
+        不同钓点/分辨率下真实下沉幅度不同，只能实测。
+
+        采样期间浮标还没进入咬钩监控，所以这 17 秒的鱼咬钩不会被
+        误判；采完把 strike_value 改成实测值，本竿照常继续。
+        """
+        if not self.calib_sink or self._sink_calibrated:
+            return
+        self._sink_calibrated = True      # 无论成败都只做一次
+        # 标定期间浮标本来就会漂/沉，找不到不算「这个钓点太暗」
+        self.bobber_finder.suppress_abort = True
+        try:
+            from .sinkcalib import SinkCalibrator
+            dump = self._dump_bmp if self.debug_frames else None
+            calib = SinkCalibrator(
+                self.bobber_finder,
+                getattr(self.bobber_finder, "grabber", None),
+                log=self.log,
+                seconds=self.sink_calib_seconds,
+                dump=dump)
+            # v36：无论 --debug 是否开启，标定期每帧都存「全屏 + 区域」两张图。
+            # 坐标/尺寸写在文件名里，方便直接对号入座复盘。
+            try:
+                calib._frame_dump = self.dump_frame_pair
+            except Exception:
+                pass
+            got = calib.run()
+            ref = None
+            try:
+                for (_t, _y, _a, b) in getattr(calib, "points", []):
+                    if b is not None:
+                        ref = b        # 取最后一帧作为确认图的底图
+            except Exception:
+                ref = None
+
+            # v25：先把天空/水面分界线测出来并交给 finder。
+            # 用户明确要求「严格按第一次抛竿后的画面确定排除区」，
+            # 所以地平线不依赖序列定位成败，独立生效。
+            try:
+                hz, hconf = calib.detect_horizon()
+            except Exception as e:
+                hz, hconf = None, 0.0
+                self.log("地平线检测异常 %s", e)
+            bf0 = self.bobber_finder
+            # 置信度门槛：低于 min_horizon_conf 视为「没测出」。
+            # 实测：原版坐标 (640,400) 下海平面贴在第 1 行，检出
+            # y=1 但置信只有 30x；而 370 坐标下置信 73x。贴边那种 30x
+            # 虽然位置对，但上均亮 61 / 下均亮 49 差得很少，说明
+            # 区里几乎没有天空 —— 这时按它排除会误伤第 2 行起的浮标。
+            min_conf = getattr(self, "min_horizon_conf", 15.0)
+            if hz is not None and hconf < min_conf:
+                self.log("地平线 y=%d 置信度仅 %.1fx（< %.0fx），"
+                         "判定为不可信，上方不做排除", int(hz), hconf, min_conf)
+                hz = None
+            if hz is not None:
+                bf0.sky_limit_y = int(hz)
+                self.log("排除区已定: 天空分界线 y=%d（置信度 %.1fx），"
+                         "上方全部排除；左右各 %.0f%%、下方 %.0f%%",
+                         int(hz), hconf,
+                         100.0 * bf0.exclude_side_ratio,
+                         100.0 * bf0.exclude_bottom_ratio)
+            else:
+                bf0.sky_limit_y = None
+                self.log("排除区: 地平线未测出/不可信，上方不排除"
+                         "（左右 %.0f%%、下方 %.0f%% 仍生效）",
+                         100.0 * bf0.exclude_side_ratio,
+                         100.0 * bf0.exclude_bottom_ratio)
+
+            # 存一张排除区确认图（无论 --debug 是否开，这条信息必须人工核对）
+            try:
+                if ref is not None:
+                    self._dump_confirm(
+                        ref, "confirm_zone",
+                        "分界线y%d" % (int(hz) if hz is not None else -1),
+                        boxes=self._boxes_for_zones(ref))
+            except Exception as e:
+                self.log("排除区确认图异常 %s", e)
+
+            # v23：用这 17 帧顺便定位浮标（不看颜色，只认「抛竿后持续
+            # 存在且不动」的团块）。成功就用它固定锚点，比抛竿后 2 秒
+            # 的单帧差分可靠得多 —— 后者实测 post 帧里根本没有浮标。
+            try:
+                loc = calib.locate_in_sequence()
+            except Exception as e:
+                loc = None
+                self.log("序列定位异常 %s", e)
+            if loc:
+                bf = self.bobber_finder
+                # 整屏被判成浮标 = 明显误判（实测 1276x634 全屏面积）。
+                # 这种情况不采信锚点，也不放宽 tan —— 否则门槛塌掉。
+                lw = loc.get("w", 0)
+                lh = loc.get("h", 0)
+                la = loc.get("area", 0)
+                suspicious = False
+                if ref is not None:
+                    rh, rw = ref.shape[0], ref.shape[1]
+                    if la > 0.20 * rw * rh:
+                        suspicious = True
+                if suspicious:
+                    self.log("序列定位可疑: 面积 %d 占画面 %.0f%%，判为误判，不采信锚点"
+                             "（保留原版颜色搜索）", la,
+                             100.0 * la / float(rw * rh) if ref is not None else 0.0)
+                    loc = None
+
+            if loc:
+                bf = self.bobber_finder
+                if hasattr(bf, "previous_location"):
+                    bf.previous_location = (loc["x"], loc["y"])
+                bf._calib_result = loc
+                try:
+                    sig = __import__("fishingfun.bobbercalib", fromlist=["x"]).signature_from(loc["median_rgb"])
+                    c = bf.pixel_classifier
+                    c.tan_min_red = min(c.tan_min_red, sig["tan_min_red"])
+                    c.tan_min_rb = min(c.tan_min_rb, sig["tan_min_rb"])
+                    c.tan_min_rg = min(c.tan_min_rg, sig["tan_min_rg"])
+                    self.log("锚点已按序列定位固定: (%d,%d) → tan 放宽为 r>=%d rb>=%d rg>=%d",
+                             loc["x"], loc["y"],
+                             c.tan_min_red, c.tan_min_rb, c.tan_min_rg)
+                except Exception as e:
+                    self.log("锚点固定但 tan 放宽失败 %s", e)
+                # 确认图：红框=序列定位认定的浮标
+                try:
+                    if ref is not None:
+                        bx = [(int(loc["x"] - lw / 2), int(loc["y"] - lh / 2),
+                               int(loc["x"] + lw / 2), int(loc["y"] + lh / 2), "red")]
+                        self._dump_confirm(ref, "confirm_anchor",
+                                           "锚点%d_%d" % (int(loc["x"]), int(loc["y"])),
+                                           boxes=self._boxes_for_zones(ref, bx))
+                except Exception as e:
+                    self.log("锚点确认图异常 %s", e)
+            else:
+                self.log("序列定位未命中，锚点仍由原版颜色搜索决定")
+                try:
+                    if ref is not None:
+                        self._dump_confirm(ref, "confirm_anchor_none", "序列定位未命中",
+                                           boxes=self._boxes_for_zones(ref))
+                except Exception as e:
+                    self.log("锚点确认图异常 %s", e)
+
+
+            if got:
+                old = getattr(self.bite_watcher, "strike_value", None)
+                self.bite_watcher.strike_value = int(got)
+                self.log("咬钩阈值已按实测标定: strike_value %s → %d", old, int(got))
+            else:
+                self.log("咬钩标定没拿到有效数据，沿用原阈值 %s",
+                         getattr(self.bite_watcher, "strike_value", "?"))
+        except Exception as e:
+            self.log("咬钩标定异常 %s，沿用原阈值", e)
+        finally:
+            # 标定结束，恢复正常判定
+            self.bobber_finder.suppress_abort = False
+            self.bobber_finder.no_bobber_frames = 0
+
+    def _has_yellow_post(self, bmp):
+        """这一帧里有没有黄浮标（够多才算落水）。
+
+        阈值 60px：实测真实浮标 652~657px，水面噪声 0px，
+        取 60 留足余量又不至于被零星高光骗过。
+        """
+        try:
+            from .bobbercalib import yellow_mask
+            return int(yellow_mask(bmp).sum()) >= 60
+        except Exception:
+            return False
+
+    # ---- 逐行对应 FishBot.cs:76-86 ----
+    def _watch(self, milliseconds):
+        self.bobber_finder.reset()
+        # 飞行期：浮标还在天上/刚落水，这一段的「找不到」没有任何诊断价值，
+        # 不能让它凑满 no_bobber_limit 直接停机（实测第一竿 0.7s 就停了）。
+        self.bobber_finder.suppress_abort = True
+        # ★ v37：飞行期禁止定锚。
+        #   实测（帧数据验证）：抛竿后 53ms，浮标还在空中，画面是上一竿的
+        #   残留影像。此时全图搜索会抓到一个「连续 3 帧位置都稳定」的暖色块
+        #   （实测 (701,24) 26x27 area=445，真浮标却在 (820,342)，差 123/318 px），
+        #   一旦写进 previous_location 就锁死在 ±40px 窗口里追错目标到收竿。
+        #   飞行期只记录位置、不回写锚点；落水后再由稳定性判定定锚。
+        self.bobber_finder.no_anchor_lock = True
+        if hasattr(self.bobber_finder, "loose_aspect"):
+            self.bobber_finder.loose_aspect = True     # 抛竿飞行期长宽比失真
+        start = time.monotonic()
+        frames = hits = 0
+        last = None
+        last_bmp = None
+        # v22：post 帧不再取「2 秒那一刻」，而是取「黄色浮标真正出现」那一帧。
+        # 实测 c006_post（2 秒帧）整帧 r max 只有 122，黄浮标(r=255)一个都没有
+        # —— 浮标还在空中。用 0 个黄像素的帧去差分，必然挑到水面杂块。
+        post_bmp = None
+        post_at = None
+        post_deadline = start + 6.0      # 最多等 6 秒，等不到就用最后一帧兜底
+        try:
+            while (time.monotonic() - start) * 1000.0 < milliseconds:
+                pos = self.bobber_finder.find()
+                frames += 1
+                # v20：留存本次抓到的原始帧，循环结束时它就是 post
+                last_bmp = getattr(self.bobber_finder, "_bmp", None)
+                # v22：这一帧里已经能看见黄浮标 → 它就是合格的 post
+                if post_bmp is None and last_bmp is not None:
+                    if self._has_yellow_post(last_bmp):
+                        post_bmp = last_bmp
+                        post_at = time.monotonic() - start
+                if pos is not None:
+                    hits += 1
+                    last = pos
+            # _watch 结束后继续等黄色浮标出现，最多到 6 秒
+            while post_bmp is None and time.monotonic() < post_deadline:
+                pos = self.bobber_finder.find()
+                last_bmp = getattr(self.bobber_finder, "_bmp", None)
+                if pos is not None:
+                    last = pos
+                if last_bmp is not None and self._has_yellow_post(last_bmp):
+                    post_bmp = last_bmp
+                    post_at = time.monotonic() - start
+                    break
+                time.sleep(0.05)
+        finally:
+            if hasattr(self.bobber_finder, "loose_aspect"):
+                self.bobber_finder.loose_aspect = False
+            # v37：飞行期结束，放行定锚
+            self.bobber_finder.no_anchor_lock = False
+        # v22：post 帧优先用「浮标已出现」那一帧；没等到才用最后一帧兜底
+        used = post_bmp if post_bmp is not None else last_bmp
+        if used is not None and hasattr(self.bobber_finder, "calib_pre"):
+            self.bobber_finder._calib_bmp = used
+            if post_bmp is not None:
+                self.log("post 帧: 浮标已出现（抛竿后 %.1fs）", post_at or 0.0)
+            else:
+                self.log("post 帧: 等黄色浮标 6s 未出现，改用最后一帧兜底")
+            if (getattr(self, "debug_frames", False)
+                    and getattr(self.bobber_finder, "calib_pre", None) is not None):
+                try:
+                    self._dump_bmp(used, "calib_post")
+                except Exception as e:
+                    self.log("差分标定: post 落盘失败 %s", e)
+        self.log("抛竿后跟踪 %.1fs: %d 帧, 命中 %d 帧, 末位置 %s",
+                 milliseconds / 1000.0, frames, hits, last)
+        self._last_track = (frames, hits)     # 供 _wait_for_bite 判锚点可信度
+        # 飞行期结束：下面开始正式找锚点，这时候找不到才是真问题
+        self.bobber_finder.suppress_abort = False
+        self.bobber_finder.no_bobber_frames = 0
+
+        # 注意：抛竿后立刻抓一帧 BMP 会占满 IO，且此刻光标可能还在画面里，
+        # 只在「找不到浮标」时才落盘（见 _wait_for_bite），平时不抓。
+
+    # ---- 逐行对应 FishBot.cs:94-125 ----
+    def _wait_for_bite(self):
+        self.bobber_finder.reset()
+
+        # 非原版改进：找锚点阶段。抛竿后浮标要飞 0.5~1 秒才落水，落水后
+        # 还有水花遮挡，这一段单帧扫不到浮标是正常的。所以不能「一帧没扫
+        # 到就重抛」（v14 的 anchor_wait=1.5s 单次判定就是被用户看到的
+        # 「1 秒重复抛竿」）。改为：连续 miss_frames 帧且总时长超过
+        # anchor_wait 才算真的没有浮标。
+        anchor_wait = getattr(self, "anchor_wait", 4.0)
+        miss_need = getattr(self, "anchor_miss_frames", 12)   # v18 起不再用于提前退出
+        # v18：抛竿后浮标要飞 0.5~1.8 秒才落水，加水面荡开的水花，这段时间
+        # 全部 miss 是必然而非异常。旧代码 `miss >= 12 and elapsed >= 1.2`
+        # 会在 1.2 秒就退出（v17 实测 20/20 次全是 miss@1.2s），把
+        # --anchor-wait 3.0 完全架空，这就是"抛竿1秒多又重抛"的根因。
+        # 现在改为：飞行期内 miss 一律不计数，之后全程等满 anchor_wait。
+        flight = getattr(self, "cast_flight", 1.8)
+        t0 = time.monotonic()
+        bobber_position = None
+        miss = 0
+        frames = 0
+
+        # v20：差分标定。_watch(2000) 已经把 post 帧存好了，先试着用
+        # 「抛竿前 vs 抛竿后2秒」两张图差出浮标。成功就直接当锚点，
+        # 完全不用碰颜色阈值 —— 换钓点浮标被压暗也不会失效。
+        bf = self.bobber_finder
+        if (getattr(bf, "calib_enabled", False)
+                and getattr(bf, "calib_pre", None) is not None
+                and getattr(bf, "_calib_bmp", None) is not None):
+            try:
+                bobber_position = bf._calibrate(bf._calib_bmp)
+            except Exception as e:
+                self.log("差分标定异常: %s", e)
+                bobber_position = None
+            if bobber_position is not None:
+                # 锁定到 previous_location，后续帧走原版 ±40px 窗口跟踪
+                bf.previous_location = bobber_position
+                self.log("浮标位置: %s（差分标定，本竿固定）", bobber_position)
+            else:
+                self.log("差分标定未命中，退回逐帧颜色搜索")
+        # 差分没成功才走原版找锚点循环
+        if bobber_position is None:
+            while self.is_enabled:
+                elapsed = time.monotonic() - t0
+                if elapsed >= anchor_wait:
+                    break
+                # ★ v37：飞行/水花期内只检测、不锁定锚点。
+                #   实测日志 20:06:22.445（抛竿后 53ms）锁到的 (701,24)
+                #   是上一竿残留影像：那块 rgb=(29,48,65) R-B=-31，
+                #   按色差判据根本不可能选中，是 _find_points 的 TAN 路径
+                #   在空画面里凑出来的。落水前锁定它 = 整竿追错目标。
+                bf = self.bobber_finder
+                if hasattr(bf, "no_anchor_lock"):
+                    bf.no_anchor_lock = elapsed < flight
+                try:
+                    bobber_position = self.bobber_finder.find()
+                finally:
+                    if hasattr(bf, "no_anchor_lock"):
+                        bf.no_anchor_lock = False
+                frames += 1
+                if bobber_position is not None:
+                    break
+                # v18：飞行/水花期内不计 miss，只统计"落水后仍找不到"的次数
+                if elapsed >= flight:
+                    miss += 1
+        if bobber_position is None:            # Point.Empty
+            # v18：已删除 miss 提前退出，现在只可能是 anchor_wait 超时
+            self.log("DIAG找锚点 退出耗时=%.2fs 帧=%d miss(落水后)=%d anchor_wait=%.1f 飞行期=%.1fs 原因=anchor_wait超时",
+                     time.monotonic() - t0, frames, miss, anchor_wait, flight)
+            try:
+                self._diag["noanchor"].append(f"超时@{time.monotonic()-t0:.1f}s")
+            except Exception:
+                pass
+            self.log("未找到浮标（%.1fs / %d 帧全丢），重抛",
+                     time.monotonic() - t0, frames)
+            try:
+                self._dump_frame("lost", None)   # 只在失败时存一张，事后排查用
+            except Exception as e:
+                self.log("诊断: 失败帧落盘失败 %s", e)
+            # 确认图：这一帧里浮标到底在不在、在不在排除区外
+            try:
+                g = getattr(self.bobber_finder, "grabber", None)
+                if g is not None:
+                    fb = g.grab()
+                    self._dump_confirm(fb, "confirm_lost", "找锚点失败", 
+                                       boxes=self._boxes_for_zones(fb))
+            except Exception as e:
+                self.log("确认图异常 %s", e)
+            return
+
+        self.bite_watcher.reset(bobber_position)
+        self.log("浮标位置: %s（拾取锚点，本竿固定）", bobber_position)
+
+        # 非原版：锚点可信度检查。若 2 秒跟踪期命中帧占比过低（<45%），
+        # 说明真鱼鳔大部分帧检测不到，锚点很可能是旁边别的米黄物体，
+        # 整个 25 秒都会拿它当基准 → 满屏误判。直接放弃本竿重抛。
+        track = getattr(self, "_last_track", None)
+        if track:
+            frames, hits = track
+            ratio = hits / float(frames or 1)
+            thresh = getattr(self, "anchor_ratio_min", 0.35)
+            self.log("锚点可信度: %d/%d 帧 = %.0f%%", hits, frames, ratio * 100)
+            # 诊断(v17)：输出命中率分布，用于定门槛。不改判定行为。
+            self.log("DIAG可信度 n=%d hits=%d ratio=%.3f 门槛=%.2f", frames, hits, ratio, thresh)
+            try:
+                self._diag["conf"].append(ratio)
+            except Exception:
+                pass
+            # v18：门槛 0.45 → 0.35。v17 实测 76 个样本呈双峰分布：
+            #   0.36~0.45 有 34 次(45%)、0.70~1.00 有 42 次(55%)、中间无样本。
+            # 双峰说明"要么浮标清楚、要么基本看不见"，不存在勉强能看的过渡带；
+            # 0.45 正好切在低峰中间，把 45% 的竿全拒掉造成无效重抛。
+            # 降到 0.35（实测最低 0.359）等于不再误拒，同时保留极端保护。
+            if ratio < thresh:
+                self.log("锚点可信度不足（%.0f%% < %.0f%%），本竿放弃重抛", ratio * 100, thresh * 100)
+                return
+
+        robust = getattr(self.bite_watcher, "mode", "legacy") == "robust"
+
+        # 非原版：抛竿后稳定期。落水/水花/UI 弹字会让浮标一出现就带 y 抖动，
+        # 这段时间内的 yDiff 全部是噪声（实测多次 0.3~1.7 秒就误报咬钩），
+        # 稳定期内只更新水面基准、不判定咬钩。
+        settle = getattr(self, "settle_time", 3.0)
+        t_anchor = time.monotonic()
+        settled = False
+        if robust and settle > 0:
+            self.log("稳定期 %.1fs 内不判咬钩（只更新水面基准）", settle)
+
+        timed_task = TimedAction(
+            lambda a: self.log("Fishing timed out!"), 25 * 1000, 25)
+
+        while self.is_enabled:
+            # 非原版改进：_find_bobber 内部最多重试 5 次×1s，浮标消失那一帧
+            # 它能卡 2~5 秒，vanish 计数被吃掉 → 只能等 25s 超时。这里单帧取图。
+            _t0 = time.monotonic()
+            current = self.bobber_finder.find()
+            _dt = time.monotonic() - _t0
+            if current is None and _dt > 0.4:
+                self.log("单帧扫描耗时 %.2fs（浮标可能已消失）", _dt)
+
+            # robust 模式：浮标消失本身是咬钩信号，必须传给 watcher
+            if robust:
+                elapsed = time.monotonic() - t_anchor
+                if not settled:
+                    if elapsed < settle:
+                        # 稳定期：只喂 y 更新水面基准，吞掉一切判定
+                        if current is not None:
+                            self.bite_watcher.observe(current[1])
+                        if not timed_task.execute_if_due():
+                            return
+                        continue
+                    settled = True
+                    self.log("稳定期结束（%.1fs），开始判咬钩", elapsed)
+
+                if self.bite_watcher.is_bite(current):
+                    self.log("咬钩判定: 下沉 yDiff=%s（%s）",
+                             self.bite_watcher.y_diff,
+                             "浮标消失" if current is None else "位置下沉")
+                    # 非原版调试：判定的同时存「咬钩前」帧（浮标此刻原样）
+                    self._dump_dbg("pre", bobber_position, current)
+                    self._loot(bobber_position)     # ← 传抛竿位置，不是 current
+                    self._press_ten_min_key_if_due()
+                    return
+                if current is not None and current[0] == 0:
+                    return
+            else:
+                # 原版逻辑：找不到浮标直接放弃本竿
+                if current is None or current[0] == 0:
+                    return
+
+                if self.bite_watcher.is_bite(current):
+                    self._loot(bobber_position)     # ← 传抛竿位置，不是 current
+                    self._press_ten_min_key_if_due()
+                    return
+
+            if not timed_task.execute_if_due():
+                return
+
+            # 心跳：每 ~3 秒报一次当前状态（解决"静默 16 秒看不出在干什么"）
+            now = time.monotonic()
+            if now - getattr(self, "_last_beat", 0) >= 3.0:
+                self._last_beat = now
+                self.log("监控中: 浮标=%s yDiff=%s 连续=%d 消失计数=%d",
+                         current, getattr(self.bite_watcher, "y_diff", "?"),
+                         getattr(self.bite_watcher, "_streak", 0),
+                         getattr(self.bite_watcher, "_vanish", 0))
+
+    # ---- 逐行对应 FishBot.cs:164-168 ----
+    def _loot(self, bobber_position):
+        # 收竿前先拍一张「基准」：如果这行字本来就还挂在屏幕上（上一竿残留），
+        # 之后就不能把它当成这一竿的结果。
+        pre_hit = False
+        nd = self.no_bite_detector
+        if nd is not None:
+            try:
+                _pr = nd.check()
+                pre_hit = _pr.get("hit", False)
+                # v19：收竿前若已有黄字（上一竿残留），先等它消失再继续，
+                # 旧版直接按「真咬钩」放行 → 误判被静默吞掉。
+                if pre_hit:
+                    self.log("DIAG基准 收竿前已有黄字 px=%d rows=%d span=%d，等残留消失",
+                             _pr.get("px", 0), _pr.get("rows", 0), _pr.get("span", 0))
+                    try:
+                        self._diag["prehit"] = self._diag.get("prehit", 0) + 1
+                    except Exception:
+                        pass
+                    cleared = nd.wait_clear(timeout=6.0, poll=0.15)
+                    if cleared:
+                        self.log("DIAG基准 残留已消失，本竿重新建立基准")
+                        pre_hit = False
+                    else:
+                        self.log("DIAG基准 ⚠️残留 6.0s 未消失，本竿判定不可靠")
+            except Exception:
+                pre_hit = False
+
+        self.log("Right clicking mouse to Loot @ %s", bobber_position)
+        self.wow_process.right_click_mouse(bobber_position)
+        # 非原版调试：拾取动作做完立刻存「拾取后」帧（含聊天框物品提示）
+        self._dump_dbg("post", bobber_position, None)
+        # 非原版：判收竿结果 —— 屏幕上方弹出「没有鱼上钩」= 时机不对，其实没鱼
+        nb_hit, nb_res = self._check_no_bite()
+        # 诊断(v17)：记录本竿最终归属，重点看 pre_hit=True 的竿（基准污染）
+        _own = "误判" if (nb_hit and not pre_hit) else ("被基准吞" if (nb_hit and pre_hit) else "真咬钩")
+        self.log("DIAG归属 pre_hit=%s nb_hit=%s -> %s", pre_hit, nb_hit, _own)
+        try:
+            _k = {"误判": "miss", "被基准吞": "eaten", "真咬钩": "hit"}[_own]
+            self._diag["own"][_k] = self._diag["own"].get(_k, 0) + 1
+        except Exception:
+            pass
+        if nb_hit and not pre_hit:
+            self.miss_count += 1
+            self.log("收竿结果: 没有鱼上钩（误判，实际没咬钩） px=%d rows=%d",
+                     nb_res.get("px", 0), nb_res.get("rows", 0))
+            # 这行字约 4 秒后消失；等它清掉再重抛，避免下一竿读到残留
+            if nd is not None:
+                try:
+                    cleared = nd.wait_clear(timeout=4.5, poll=0.2)
+                    if not cleared:
+                        self.log("⚠️「没有鱼上钩」4.5 秒未消失，下一竿判定可能不准")
+                except Exception:
+                    pass
+            return
+        if pre_hit:
+            self.log("收竿结果: 屏幕已有「没有鱼上钩」残留，本轮无法判定，按真咬钩处理")
+        else:
+            self.log("收竿结果: 未出现「没有鱼上钩」→ 咬钩时机正确")
+        self.hit_count += 1
+        self._read_loot()
+
+    # ---- 非原版增强：确认是否「没有鱼上钩」 ----
+    def _check_no_bite(self):
+        """右键收竿后 ~1.8 秒内，看屏幕上方是否弹出黄字「没有鱼上钩」。
+
+        用户实测（2026-11-01）：钓鱼时机正确时每次都能钓到；
+        时机不对（收竿过早）游戏会在固定位置弹「没有鱼上钩」。
+        所以这行字是判断「咬钩判定对不对」最硬的依据。
+        """
+        nd = self.no_bite_detector
+        if nd is None:
+            return False, {}
+        t0 = time.monotonic()
+        try:
+            hit, res = nd.confirm_no_bite(timeout=5.0, poll=0.10)
+        except Exception as e:
+            self.log("检测「没有鱼上钩」异常: %s", e)
+            return False, {}
+        # 诊断(v17)：无论命中与否都记录峰值，用于判断是「没扫到」还是「扫到不够阈值」。
+        # pre=收竿前基准命中（若为 True 说明本竿判定被前置基准污染）。
+        try:
+            self.log("DIAG黄字 hit=%s px=%d rows=%d span=%d 耗时=%.2fs",
+                     hit, res.get("px", 0), res.get("rows", 0),
+                     res.get("span", 0), time.monotonic() - t0)
+            self._diag["nobite"].append((hit, res.get("px", 0), res.get("rows", 0),
+                                         res.get("span", 0)))
+        except Exception:
+            pass
+        return hit, res
+
+    # ---- 非原版增强：拾取后读聊天框物品提示 ----
+    def _read_loot(self):
+        """拾取动作做完后读一行「你获得了物品：[xxx]」写进日志。
+
+        判定口径：拾取前的指纹 → 拾取后 3 秒内出现不同的物品提示行，
+        才算这一竿真的捡到东西。读不到就记「(未见物品提示)」，
+        这样误判咬钩（其实没鱼）会立刻在日志里暴露。
+        """
+        lr = self.loot_reader
+        if lr is None:
+            return
+        try:
+            hit, name, fp = lr.wait_new_loot(self._loot_fp, timeout=3.0)
+            self._loot_fp = fp or self._loot_fp
+        except Exception as e:
+            self.log("读物品提示异常: %s", e)
+            return
+        if hit:
+            label = name or "(未识别)"
+            self.loot_stats[label] = self.loot_stats.get(label, 0) + 1
+            self.log("拾取成功: 你获得了物品 [%s]  累计=%d  %s",
+                     label, self.loot_stats[label],
+                     " ".join("%s×%d" % (k, v) for k, v in
+                              sorted(self.loot_stats.items(),
+                                     key=lambda kv: -kv[1])[:6]))
+        else:
+            self.log("拾取结果: (未见物品提示) —— 疑似误判/空竿")
+
+    # ---- 诊断增强（非原版）：把关键帧原图 + tan 候选全落盘 ----
+    def _write_bmp(self, bmp, path):
+        h, w = bmp.shape[:2]
+        row = w * 3
+        pad = (4 - row % 4) % 4
+        with open(path, "wb") as f:
+            f.write(b"BM")
+            size = 54 + (row + pad) * h
+            f.write(size.to_bytes(4, "little") + (0).to_bytes(4, "little")
+                    + (54).to_bytes(4, "little"))
+            f.write((40).to_bytes(4, "little") + w.to_bytes(4, "little")
+                    + h.to_bytes(4, "little") + (1).to_bytes(2, "little")
+                    + (24).to_bytes(2, "little"))
+            f.write((0).to_bytes(4, "little") + (row + pad).to_bytes(4, "little")
+                    + (2835).to_bytes(4, "little") + (2835).to_bytes(4, "little")
+                    + (0).to_bytes(4, "little") + (0).to_bytes(4, "little"))
+            for y in range(h - 1, -1, -1):
+                f.write(bmp[y, :, ::-1].tobytes())
+                if pad:
+                    f.write(b"\x00" * pad)
+
+    # ---- 非原版调试：每竿 pre/post 两帧落盘 ----
+    def _dump_dbg(self, tag, anchor=None, current=None):
+        """把当前截屏原样存 debug/，文件名带竿号和关键坐标。
+
+        pre  = 咬钩判定那一刻（浮标还在，用于判断位置对不对）
+        post = 拾取动作结束后（含聊天框，用于判断有没有捡到东西）
+        """
+        if not getattr(self, "debug_frames", False):
+            return
+        grabber = getattr(self.bobber_finder, "grabber", None)
+        if grabber is None:
+            return
+        import os
+        try:
+            bmp = grabber.grab()
+            h, w = bmp.shape[:2]
+            left = top = 0
+            sa = getattr(grabber, "search_area", None)
+            if callable(sa):
+                sa_ = sa()
+                left, top = sa_[0], sa_[1]
+            d = os.path.join(os.getcwd(), self._debug_dir)
+            os.makedirs(d, exist_ok=True)
+            ay = ax = cy = cx = -1
+            if anchor is not None:
+                ax, ay = anchor[0], anchor[1]
+            if current is not None:
+                cx, cy = current[0], current[1]
+            name = "c%03d_%s_%dx%d_%d_%d_a%d_%d_c%d_%d.bmp" % (
+                self._cast_no, tag, w, h, left, top, ax, ay, cx, cy)
+            self._write_bmp(bmp, os.path.join(d, name))
+            self.log("调试帧[%s] debug/%s 锚点=(%d,%d) 当前=(%d,%d) yDiff=%s",
+                     tag, name, ax, ay, cx, cy,
+                     getattr(self.bite_watcher, "y_diff", "?"))
+        except Exception as e:
+            self.log("调试帧[%s] 落盘失败 %s", tag, e)
+
+    def _dump_frame(self, tag, chosen):
+        grabber = getattr(self.bobber_finder, "grabber", None)
+        if grabber is None:
+            return
+        import os
+        import numpy as np
+        d = os.path.join(os.getcwd(), "diag")
+        os.makedirs(d, exist_ok=True)
+
+        bmp = grabber.grab()
+        h, w = bmp.shape[:2]
+        left, top = 0, 0
+        sa = getattr(grabber, "search_area", None)
+        if callable(sa):
+            sa_ = sa()
+            left, top = sa_[0], sa_[1]
+        stamp = time.strftime("%H%M%S")
+        name = "%s_%s_%dx%d_%d_%d.bmp" % (stamp, tag, w, h, left, top)
+        path = os.path.join(d, name)
+        try:
+            self._write_bmp(bmp, path)
+        except Exception as e:
+            self.log("诊断: 写 BMP 失败 %s", e)
+            name = "(写失败)"
+
+        cand = []
+        try:
+            clf = getattr(self.bobber_finder, "pixel_classifier", None)
+            mode = getattr(clf, "mode", None)
+            if str(mode).strip().capitalize() == "Tan":
+                rgb = bmp.astype(np.int16)
+                r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+                m = ((r > 140) & (g > 105) & (b > 60) & (b < 175)
+                     & ((r - b) > 45) & ((g - b) > 15) & (np.abs(r - g) < 80))
+                ys, xs = np.nonzero(m)
+                pts = np.stack([xs, ys], 1) if len(xs) else np.zeros((0, 2), np.int64)
+                seen = np.zeros(len(pts), bool)
+                for i in range(len(pts)):
+                    if seen[i]:
+                        continue
+                    sel = (np.abs(pts[:, 0] - pts[i, 0]) <= 40) & \
+                          (np.abs(pts[:, 1] - pts[i, 1]) <= 40)
+                    seen |= sel
+                    c = pts[sel]
+                    bw = int(c[:, 0].max() - c[:, 0].min() + 1)
+                    bh = int(c[:, 1].max() - c[:, 1].min() + 1)
+                    cx = int(c[:, 0].mean()) + left
+                    cy = int(c[:, 1].mean()) + top
+                    cand.append((len(c), bw, bh, cx, cy))
+                cand.sort(reverse=True)
+        except Exception as e:
+            self.log("诊断: 候选统计失败 %s", e)
+
+        self.log("诊断帧[%s] 文件=diag/%s 选择=%s 候选数=%d", tag, name, chosen, len(cand))
+        for ci, (n, bw, bh, cx, cy) in enumerate(cand[:12]):
+            ratio = (bw / float(bh)) if bh else 0.0
+            self.log("  诊断候选#%d 像素=%d 尺寸=%dx%d 比例=%.2f 中心=(%d,%d)",
+                     ci, n, bw, bh, ratio, cx, cy)
+
+    # ---- 逐行对应 FishBot.cs:129-162 ----
+    def _press_ten_min_key_if_due(self):
+        if (time.monotonic() - self.start_time) > 600 and self.ten_min_key:
+            self._do_ten_minute_key()
+
+    def _do_ten_minute_key(self):
+        self.start_time = time.monotonic()
+        if not self.ten_min_key:
+            self.log("Ten Minute Key: No keys defined in tenMinKey")
+        for key in self.ten_min_key:
+            self.log("Ten Minute Key: Pressing key %s", key)
+            self.wow_process.press_key(key)
+
+    # ---- 逐行对应 FishBot.cs:200-209 ----
+    def _find_bobber(self):
+        timer = TimedAction(
+            lambda a: self.log("Waited seconds for target: %d", a.elapsed_secs),
+            1000, 5)
+        while True:
+            target = self.bobber_finder.find()
+            if target is not None or not timer.execute_if_due():
+                return target
