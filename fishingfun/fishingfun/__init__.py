@@ -1,8 +1,8 @@
 """FishingFun Python 移植（严格 1:1 对应 julianperrott/FishingFun 的 8 个 C# 文件）"""
 
 # 版本号：写进日志开头，一眼就能判定跑的是哪一版（避免"以为更新了其实没更新"）
-__version__ = "v38"
-BUILD = "2026-11-01 v38 时间轴对齐:①标定采样零点改为按下抛竿键时刻(17秒含飞行时间，修采样窗口晚7秒导致前段全丢) ②飞行期未检出帧不计入丢失统计(避免落水前误判咬钩) ③连续3帧丢失即提前结束采样(不再空转) ④标定采样y坐标改回截屏区局部坐标+area从检测明细解析(修y偏244/area恒0) ⑤静水抖动P90与最大净下沉分开报告+给出vanish_frames建议值"
+__version__ = "v39"
+BUILD = "2026-11-01 v39 真机日志四修:①黄色判据蓝通道上限100→175(修B钓点浮标rgb(227,190,142)被判无黄标,固等6秒) ②_watch见到色差已锁定就立即结束不再等黄标(修标定窗口被吃掉4.8秒) ③anchor_wait自动抬到飞行期+1.5s(修1.5<1.8浮标在空中就判重抛) ④地平线候选过于贴顶(<2%行高)判UI硬边不排除天空侧(修y=9)"
 
 from .pixelclassifier import PixelClassifier, TanClassifier
 from .searchbobberfinder import SearchBobberFinder

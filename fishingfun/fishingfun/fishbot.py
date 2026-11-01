@@ -533,8 +533,24 @@ class FishingBot:
                 if pos is not None:
                     hits += 1
                     last = pos
-            # _watch 结束后继续等黄色浮标出现，最多到 6 秒
+            # _watch 结束后继续等黄色浮标出现，最多到 6 秒。
+            # ★ v38：加一条「已经靠色差锁定浮标」的提前退出。
+            #   实测日志：20:42:03.607 色差浮标已命中 (775,280)，
+            #   但这里仍然硬等满 6 秒（20:42:09.025 才退出），
+            #   把后续标定的 17 秒窗口吃掉 4 秒 —— 标定 t0 从 6.8s 起算，
+            #   采样只覆盖到 16s 就被 17s 上限截断。
+            #   既然色差已经稳定命中（连续 3 帧确认过），就没有必要再等
+            #   「黄色浮标」这个更弱的判据；两帧差分标定用哪一帧都能做。
             while post_bmp is None and time.monotonic() < post_deadline:
+                # 色差已锁定 → 当前帧就是合格的 post，立即收工
+                if last is not None:
+                    lb = getattr(self.bobber_finder, "_bmp", None)
+                    if lb is not None:
+                        post_bmp = lb
+                        post_at = time.monotonic() - start
+                        self.log("post 帧: 色差已锁定浮标 (%.1fs)，不再等黄色判据",
+                                 post_at)
+                        break
                 pos = self.bobber_finder.find()
                 last_bmp = getattr(self.bobber_finder, "_bmp", None)
                 if pos is not None:
@@ -590,6 +606,19 @@ class FishingBot:
         # --anchor-wait 3.0 完全架空，这就是"抛竿1秒多又重抛"的根因。
         # 现在改为：飞行期内 miss 一律不计数，之后全程等满 anchor_wait。
         flight = getattr(self, "cast_flight", 1.8)
+        # ★ v38：anchor_wait 必须大于飞行期，否则找锚点循环在浮标还没落水
+        #   时就超时退出了。实测日志（v38 第一次真机跑）：
+        #       找锚点超时: 1.5s | 飞行期 1.8s
+        #       DIAG找锚点 退出耗时=0.15s ... anchor_wait=1.5 飞行期=1.8s
+        #   1.5 < 1.8，浮标还在空中就已经「找不到」，于是每竿都判重抛，
+        #   用户看到的是「抛一竿就停」。这里强制抬到 flight + 1.5s 的落水
+        #   观察余量，保住原本语义又不与飞行期矛盾。
+        min_wait = flight + 1.5
+        if anchor_wait < min_wait:
+            self.log("找锚点超时 %.1fs < 飞行期 %.1fs + 余量，自动抬到 %.1fs"
+                     "（否则浮标还在空中就判重抛）",
+                     anchor_wait, flight, min_wait)
+            anchor_wait = min_wait
         t0 = time.monotonic()
         bobber_position = None
         miss = 0

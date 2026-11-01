@@ -184,6 +184,16 @@ class SinkCalibrator:
         seg = G[lo:hi]
         idx = int(np.argmax(seg)) + lo
         peak = float(seg.max())
+        # ★ v38：y<5 是截屏区最顶上几行，即便方向判据说「上亮下暗」也不可信
+        #   —— 那更像是窗口标题栏/UI 条与画面之间的一条硬边。真实海平面
+        #   在 1280x911 的截图区里不会只有 9 行高（实测各钓点 y=25~120）。
+        #   真判据交给下面的方向检查；这里只挡住「几乎没有天空」的病态值。
+        min_hz = max(20, int(h * 0.02))
+        if idx < min_hz:
+            self.log("⚠️  地平线候选 y=%d 过于贴近截图区顶边（< %d），"
+                     "判定为窗口 UI 硬边，本次不排除天空侧", idx, min_hz)
+            self._horizon_conf = 0.0
+            return None, 0.0
         # 置信度：峰值要显著高于整段的中位数，否则说明没有清晰分界
         med = float(np.median(seg)) or 1e-6
         conf = peak / med
