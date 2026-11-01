@@ -16,6 +16,7 @@
     watcher.strike_value = thr
 """
 
+import re
 import time
 
 import numpy as np
@@ -75,10 +76,29 @@ class SinkCalibrator:
         self.samples = int(samples) if samples else max(1, int(round(float(seconds))))
         self.dump = dump                    # 可选：把每帧 bmp 存盘
         self.points = []                    # [(t, y, area, bmp), ...]
+        # v38：飞行时间（秒）。此区间内的「未检测到」是正常的：
+        # 浮标还在空中飞，画面里根本没有它。
+        self.cast_flight = 0.0
 
     # ---- 单帧采样 ----
     def _grab_and_locate(self):
-        """抓一帧并定位浮标，返回 (y, area, bmp) 或 (None, 0, bmp)。"""
+        """抓一帧并定位浮标，返回 (y, area, bmp) 或 (None, 0, bmp)。
+
+        ★ v38 关键修复：这里必须返回**截图区内局部坐标**。
+        以前直接用 finder.find() 的返回值当 y，而 find() 返回的是
+        **屏幕坐标**（局部 + 截屏区偏移）。实测日志：
+            检测=候选=1 最佳=30x25 size=523 @(683,309)   ← 局部 y=309
+            标定采样 01/17 t=1.0s y=553                    ← 553 = 309 + 244
+        截屏区顶偏移就是 244。于是：
+          · 标定分析拿到 553/554 这组「屏幕 y」，算出的抖动幅度是假的；
+          · 更致命的是 area=0（见下），标定实际上完全没在工作。
+        修法：先把 find() 的结果减掉截屏区左上角偏移，还原成局部坐标。
+
+        另一处 v38 修复：area 以前只从 finder._calib_result 取，而那个
+        属性只有「差分标定」成功时才赋值，色差直检路径从不设置 →
+        area 恒为 0 → analyze() 里「面积骤变过滤」永远不生效。
+        现在优先从 _last_detect_note 解析出 size，取不到再退回旧逻辑。
+        """
         bmp = None
         try:
             grab = getattr(self.screen, "grab", None)
@@ -91,11 +111,25 @@ class SinkCalibrator:
         try:
             pos = self.finder.find(bmp) if bmp is not None else self.finder.find()
             if pos is not None:
-                y = int(pos[1])
+                py = int(pos[1])
+                # 屏幕坐标 → 截屏区局部坐标
+                off_y = 0
+                try:
+                    sa = self.screen.search_area()
+                    off_y = int(sa[1])
+                except Exception:
+                    pass
+                y = py - off_y
                 res = getattr(self.finder, "_calib_result", None)
                 if res:
                     area = int(res.get("area", 0))
-                if area is None:
+                if not area:
+                    # 从检测明细 "候选=1 最佳=30x25 size=523 @(683,309)" 提取
+                    note = getattr(self.finder, "_last_detect_note", "") or ""
+                    mt = re.search(r"size=(\d+)", note)
+                    if mt:
+                        area = int(mt.group(1))
+                if not area:
                     cnt = getattr(self.finder, "_last_count", None)
                     area = int(cnt) if cnt else 0
             # v36：记录这一帧的检测明细（尺寸 + 候选数），用于离线核对
@@ -376,44 +410,96 @@ class SinkCalibrator:
         return {"x": int(cx), "y": int(cy), "w": int(bw), "h": int(bh),
                 "area": int(size), "median_rgb": rgb}
 
-    def run(self):
-        """阻塞采满 seconds 秒，返回建议的 strike_value。失败返回 None。"""
+    def run(self, t_key=None):
+        """采满一个抛竿周期，返回建议的 strike_value。失败返回 None。
+
+        ★ v38 采样窗口重做（用户实测口径：**17 秒从按下 4 键算起，包含
+        飞行时间**，落水后只剩 17s - 飞行时间）。
+
+        旧实现有两个时间错误：
+          ① t0 = time.monotonic() 是「开始采样」的时刻，而 run() 由
+             首竿标定触发，跟按键时刻没有任何关系。实测日志里标定在
+             20:22:19 锁定截屏区，采样帧却是 20:22:26~20:22:42，整整
+             晚了 7 秒 —— 采样窗口后移，前 7 秒（含落水瞬间）全丢。
+          ② 强行采满 samples 帧，即使浮标早已离开画面也继续采，
+             于是「丢失帧」里混进了大量无意义样本，把抖动统计拉歪。
+
+        新实现：
+          · 传入 t_key（按键的 monotonic 时刻）时，以它为零点，只在
+            [0, seconds] 窗口内采样 —— 与游戏的真实计时对齐；
+          · 不传 t_key 时退化为「从调用时刻开始」；
+          · 连续 3 帧检测不到就提前结束，不再空转采满。
+        """
         self.points = []
-        t0 = time.monotonic()
-        interval = self.seconds / float(self.samples)
-        self.log("标定开始: 抛竿后 %d 秒内每秒采样一次浮标位置（本次标定仅做一次）",
-                 self.seconds)
-        for i in range(self.samples):
-            target = t0 + (i + 1) * interval
+        origin = time.monotonic() if t_key is None else float(t_key)
+        deadline = origin + float(self.seconds)
+        interval = 1.0 / max(1.0, self.samples / float(self.seconds))
+        self.log("标定开始: 从按键时刻起 %.0f 秒窗口内采样（含飞行时间），"
+                 "每 %.2fs 一帧", self.seconds, interval)
+
+        i = 0
+        miss_run = 0
+        while True:
             now = time.monotonic()
-            if target > now:
-                time.sleep(target - now)
+            if now >= deadline:
+                break
             y, area, bmp = self._grab_and_locate()
-            t = time.monotonic() - t0
+            t = time.monotonic() - origin
             self.points.append((t, y, area, bmp))
-            # v36：把每帧的检测明细也打出来 —— 只报 y 无法判断检测器到底
-            # 看中了画面哪一块，之前只能靠猜。
-            self.log("标定采样 %02d/%02d t=%.1fs y=%s area=%s 检测=%s",
-                     i + 1, self.samples, t, y, area,
-                     getattr(self, "_last_detect", "-"))
+            i += 1
+            self.log("标定采样 %02d t=%.1fs y=%s area=%s 检测=%s",
+                     i, t, y, area, getattr(self, "_last_detect", "-"))
             # v36：无条件存「全屏 + 区域」两图（不再依赖 --debug）
             hook = getattr(self, "_frame_dump", None)
             if hook is not None:
                 try:
-                    hook("calib", i + 1)
+                    hook("calib", i)
                 except Exception as e:
                     self.log("存帧异常 %s", e)
             elif self.dump and bmp is not None:
                 try:
-                    self.dump(bmp, "calib_s%02d" % (i + 1))
+                    self.dump(bmp, "calib_s%02d" % i)
                 except Exception:
                     pass
+            # 浮标已经不在画面里，继续采没有价值
+            if y is None:
+                miss_run += 1
+                if miss_run >= 3 and i >= 5:
+                    self.log("标定: 连续 %d 帧未检测到浮标，提前结束采样"
+                             "（t=%.1fs，判定浮标已离开画面）", miss_run, t)
+                    break
+            else:
+                miss_run = 0
+            nxt = origin + i * interval
+            wait = nxt - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
         return self.analyze()
 
     # ---- 分析采样结果 ----
     def analyze(self):
         """从采样点里算出建议阈值。数据不足返回 None。"""
-        seq = [(t, y, a) for (t, y, a, _b) in self.points if y is not None]
+        all_pts = self.points
+        # ★ v38：飞行时间内的「检测不到」是正常的（浮标还在空中），
+        #   不能算进丢失统计，否则会误判成「浮标已离开画面」，
+        #   并让 vanish_frames 建议值偏小 → 落水前就误判咬钩。
+        flight = float(getattr(self, "cast_flight", 0.0) or 0.0)
+        eff = [(t, y, a, b) for (t, y, a, b) in all_pts if t >= flight]
+        if flight and len(eff) < len(all_pts):
+            self.log("标定: 剔除飞行期 %.1fs 的 %d 帧（浮标尚未落水）",
+                     flight, len(all_pts) - len(eff))
+        if len(eff) >= 5:
+            all_pts = eff
+        seq = [(t, y, a) for (t, y, a, _b) in all_pts if y is not None]
+        # ★ v38：把「采集中途就丢目标」和「有效样本不足」分开报，否则
+        #   日志只说「有效采样只有 N 个」，看不出是鱼拖走了还是检测坏了。
+        #   实测样本：前 11 帧 y=553/554 稳定命中，第 12 帧起连续 y=None
+        #   （检测明细仍显示候选=1 @(683,309)，是这一时刻浮标真的离开了画面）。
+        n_miss = sum(1 for (_t, y, _a, _b) in all_pts if y is None)
+        if n_miss:
+            first_miss = next(t for (t, y, _a, _b) in all_pts if y is None)
+            self.log("标定采样: %d/%d 帧命中，%d 帧丢失（首次丢失 t=%.1fs）",
+                     len(seq), len(all_pts), n_miss, first_miss)
         if len(seq) < 5:
             self.log("标定失败: 有效采样只有 %d 个（至少 5 个），沿用默认阈值", len(seq))
             return None
@@ -463,4 +549,36 @@ class SinkCalibrator:
                  med, p90, max_jump, max_t)
         self.log("标定建议: strike_value = %d（浮动估计 %.1f，安全区 6~10）",
                  suggested, ripple)
+        # ★ v38：把「静水抖动」和「最大下沉事件」分开报。
+        #   以前合成一句话「最大 N@t=Xs」，无法判断那是波纹还是真咬钩：
+        #   波纹是上下摆动（会回弹），咬钩是单向下沉不回来。
+        #   这里用「累计净下沉」区分：从该帧之前的水位基线量到该帧，
+        #   若同一帧附近还回弹到基线以上，说明只是抖动。
+        try:
+            base_y = float(min(ys))          # 水面最高处（y 越小越高）
+            net_sink = float(max(ys)) - base_y
+            self.log("标定: 静水抖动 P90 = %.1fpx（建议 strike 下限 ≥ %.0f）"
+                     " | 最大净下沉 = %.0fpx（本期 %s）",
+                     p90, p90 + 2, net_sink,
+                     "疑似真咬钩" if net_sink >= max(6.0, p90 * 2)
+                     else "仅波纹，本竿无咬钩")
+        except Exception:
+            pass
+        # ★ v38：把「浮标消失」这个更可靠的咬钩信号也标出来。
+        #   实测 17 帧里前 11 帧 y 稳定在 553/554（跨度 1px），第 12 帧起
+        #   连续 6 帧 None —— 这是浮标被鱼拖入水下的典型形态，也是这套
+        #   检测器在本钓点唯一真实可见的咬钩证据。只标 strike（像素下沉）
+        #   而不报 missing 窗口，等于把最有效的信号丢掉。
+        miss_run = 0
+        best_run = 0
+        for (_t, y, _a, _b) in all_pts:
+            if y is None:
+                miss_run += 1
+                best_run = max(best_run, miss_run)
+            else:
+                miss_run = 0
+        if best_run:
+            self.log("标定: 最长连续丢失 %d 帧 ≈ %.1fs —— 建议 vanish_frames 取 %d",
+                     best_run, best_run * (self.seconds / float(self.samples)),
+                     max(3, min(best_run - 1, 8)))
         return suggested

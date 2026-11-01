@@ -51,6 +51,9 @@ class FishingBot:
         self.calib_sink = False
         self._sink_calibrated = False
         self.sink_calib_seconds = 17
+        # v38：按键时刻（monotonic）。标定采样以此为零点 —— 游戏 17 秒
+        # 窗口从按下抛竿键算起（含飞行时间），晚算一秒就少一秒有效样本。
+        self._last_cast_t = None
         self._area_armed_done = False   # 首竿标定截屏边界只做一次
 
     # ---- 非原版：首竿标定截屏边界 ----
@@ -92,6 +95,9 @@ class FishingBot:
                 # v20：抛竿前抓 pre（此刻画面里还没有浮标），抛竿后 2 秒
                 # 由 _watch 抓 post，两帧差分就能拿到浮标位置和真实色值。
                 self._grab_calib_pre()
+                # v38：记录按键时刻。游戏的 17 秒浮标窗口从按下 4 键算起
+                # （含飞行时间），标定采样必须用这个时刻当零点。
+                self._last_cast_t = time.monotonic()
                 self.wow_process.press_key(self.cast_key)
 
                 # 第一次抛竿后：绿条出现，此刻才量边界，量一次就永久锁定。
@@ -321,6 +327,11 @@ class FishingBot:
         self._sink_calibrated = True      # 无论成败都只做一次
         # 标定期间浮标本来就会漂/沉，找不到不算「这个钓点太暗」
         self.bobber_finder.suppress_abort = True
+        # ★ v38：标定期连 no_bobber_frames 也要冻结。
+        #   suppress_abort 只挡了 abort_cb，计数器仍每帧 +1，实测第一竿
+        #   抛完后计数已经爬到 68（日志「连续 68 帧」），标定结束一解除
+        #   抑制就立刻越线停机 —— 用户看到的就是「刚钓一竿就停」。
+        self.bobber_finder.no_bobber_frames = 0
         try:
             from .sinkcalib import SinkCalibrator
             dump = self._dump_bmp if self.debug_frames else None
@@ -336,7 +347,14 @@ class FishingBot:
                 calib._frame_dump = self.dump_frame_pair
             except Exception:
                 pass
-            got = calib.run()
+            # v38：把按键时刻传进去 —— 17 秒从按下 4 键算起（含飞行时间），
+            # 采样窗口必须和游戏计时对齐，否则前几秒（含落水瞬间）全丢。
+            got = calib.run(t_key=getattr(self, "_last_cast_t", None))
+            # v38：飞行时间告诉分析器，让它剔除空中的帧
+            try:
+                calib.cast_flight = float(getattr(self, "cast_flight", 0.0) or 0.0)
+            except Exception:
+                pass
             ref = None
             try:
                 for (_t, _y, _a, b) in getattr(calib, "points", []):
