@@ -57,8 +57,10 @@ def main():
                     help="抛竿飞行/水花期(秒)，期内扫不到浮标不计数（默认 1.8）")
     ap.add_argument("--anchor-ratio-min", type=float, default=0.35,
                     help="锚点可信度门槛(0~1)，低于此值本竿放弃重抛（默认 0.35）")
-    ap.add_argument("--anchor-wait", type=float, default=1.5,
-                    help="找浮标锚点最多等几秒，超时立刻重抛（默认 1.5）")
+    ap.add_argument("--anchor-wait", type=float, default=3.3,
+                    help="找浮标锚点最多等几秒，超时立刻重抛"
+                         "（默认 3.3 = 飞行期1.8 + 落水观察1.5；"
+                         "小于飞行期会导致浮标还在空中就判重抛）")
     ap.add_argument("--read-loot", default="1", choices=["1", "0"],
                     help="拾取后读聊天框「你获得了物品：[xxx]」写进日志（默认 1 开）")
     ap.add_argument("--calib", default="1", choices=["1", "0"],
