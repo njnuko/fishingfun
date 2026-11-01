@@ -77,6 +77,14 @@ def main():
                     help="收竿后检测屏幕上方「没有鱼上钩」黄字，判断咬钩是否误判（默认 1 开）")
     ap.add_argument("--debug", default="0", choices=["1", "0"],
                     help="每竿存 咬钩前/拾取后 两帧到 debug/，用于事后对比（默认 0 关）")
+    # ★ v45：复盘日志（用户要求每竿锚点 / 每秒浮动值 / 区域截图都进日志）
+    ap.add_argument("--save-regions", default="1", choices=["1", "0"],
+                    help="每竿的「锚定 / 咬钩 / 重抛」区域截图存 debug/（默认 1 开）")
+    ap.add_argument("--frame-log", default="1", choices=["1", "0"],
+                    help="判咬钩期间逐帧输出「当前y / 锚点y / 下沉px / 阈值」（默认 1 开，"
+                         "日志会变长）")
+    ap.add_argument("--trace-sec", type=float, default=1.0,
+                    help="每竿跟踪期每 N 秒存一张区域图并记一行采样（默认 1.0 秒，0=关）")
     ap.add_argument("--diff-bobber", default="1", choices=["1", "0"],
                     help="用 R-B 色差找浮标（默认 1 开）。不写死颜色，亮黄/暗橙都能找")
     ap.add_argument("--diff-threshold", type=int, default=20,
@@ -137,10 +145,13 @@ def main():
                                   confirm_frames=args.confirm_frames,
                                   vanish_frames=args.vanish_frames)
     watcher.auto_strike = args.auto_strike          # v37：抖动自适应开关
-    log("咬钩判定: mode=%s strike=%s(下限) 自适应=%s 连续确认=%d帧 消失判定=%d帧",
-        args.bite_mode, args.strike,
-        "开" if args.auto_strike else "关",
-        args.confirm_frames, args.vanish_frames)
+    # ★ v44：每竿重新锚定判定（用户指定逻辑）——
+    #   每竿第一帧用浮标特征定锚点（每竿落点不同，逐竿重定）；之后每帧算 |本竿锚点y - 当前y|，
+    #   下沉量 ≥ 第一竿标定的 strike_value 就判咬钩 → 移鼠标 → 右键拾取。
+    watcher.per_cast_anchor_mode = True
+    watcher.log = log
+    log("咬钩判定: mode=%s strike=%s(标定值) 每竿重新锚定=开 连续确认=%d帧 消失判定=%d帧",
+        args.bite_mode, args.strike, args.confirm_frames, args.vanish_frames)
     # 顺手把「去哪拿诊断截图」打出来，免得跑完找不到 diag 目录
     log("诊断截图目录: %s", os.path.join(os.getcwd(), "diag"))
 
@@ -168,14 +179,25 @@ def main():
         "开" if args.calib == "1" else "关")
     bot.fishing_event_handler = lambda e: log("event: %s", e)
 
-    # 非原版增强：找不到浮标 → 停止程序并提示用户换到亮一点的地方。
+    # 非原版增强：找不到浮标 → 停止程序并提示用户。
     # 触发条件由 finder.no_bobber_limit 控制（默认连续 3 帧）。
+    # ★ v41：必须区分两种「连续 N 帧找不到」——
+    #   (a) 本竿从未锁定过浮标 → 可能是真的看不清，提示检查；
+    #   (b) 本竿锁定过、后来又丢了 → 是咬钩（浮标沉下去）或目标离开视野，
+    #       绝不能打印「钓点太暗」误导用户（实测 20:42 日志：前面 64 帧
+    #       全部稳定命中 (773,280)，标定结束后 3 帧丢失就报「钓点太暗」）。
     def _on_no_bobber(n):
-        log("=" * 60)
-        log("⚠️  连续 %d 帧找不到浮标 —— 这个钓点太暗了", n)
-        log("⚠️  浮标颜色和水面几乎重合，色差判据失效，继续抛只会瞎钓。")
-        log("⚠️  请移动到亮一点的地方（浮标能看清的位置）再重新启动。")
-        log("=" * 60)
+        if getattr(bot, "_anchor_locked_this_cast", False):
+            log("=" * 60)
+            log("⚠️  连续 %d 帧找不到浮标 —— 本竿已锁定过浮标，判为目标消失/咬钩", n)
+            log("⚠️  不提示换钓点，重抛继续。")
+            log("=" * 60)
+        else:
+            log("=" * 60)
+            log("⚠️  连续 %d 帧找不到浮标 —— 本竿从未锁定浮标", n)
+            log("⚠️  浮标不在视野内或与水面颜色重合，继续抛只会瞎钓。")
+            log("⚠️  请确认浮标在截屏区内、能看清，再重新启动。")
+            log("=" * 60)
         bot.is_enabled = False
 
     finder.abort_cb = _on_no_bobber
@@ -220,6 +242,20 @@ def main():
     if bot.debug_frames:
         log("调试截帧: 开 | 每竿存 debug/cNNN_pre_*.bmp（咬钩前）"
             " + debug/cNNN_post_*.bmp（拾取后）")
+
+    # ★ v45：每竿可复盘日志（用户要求「每一竿的锚点、每秒标定值、区域截图」都留）
+    #   --debug 1 视为「全开」：它本来就是拿来复盘的，不该只存 pre/post 两张。
+    bot.save_regions = (args.save_regions == "1") or bot.debug_frames
+    bot.frame_log = (args.frame_log == "1") or bot.debug_frames
+    bot.trace_seconds = float(args.trace_sec)
+    watcher.frame_log = bot.frame_log
+    if bot.save_regions or bot.frame_log:
+        log("复盘日志: 区域截图=%s 逐帧浮动值=%s 跟踪逐秒采样=%.1fs",
+            "开" if bot.save_regions else "关",
+            "开" if bot.frame_log else "关", bot.trace_seconds)
+        log("  · 每竿锚点会存 debug/cNNN_锚定_区域WxH@原点_t秒_锚点x_y_*.bmp")
+        log("  · 只有「锚定 / 咬钩 / 重抛 / 跟踪逐秒」四类帧会落盘"
+            "（每帧都存会让帧率减半，反而漏判）")
 
     # 激活游戏窗口（SendInput 需要目标窗口在前台，PostMessage 不需要）
     if args.key_mode != "postmessage" and screen._hwnd:

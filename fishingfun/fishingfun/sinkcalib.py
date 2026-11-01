@@ -138,6 +138,21 @@ class SinkCalibrator:
             self.log("标定: 定位异常 %s", e)
         return y, (area or 0), bmp
 
+    def _last_xy_local(self):
+        """取最近一帧浮标的截屏区局部坐标 (x, y)，取不到返回 None。
+
+        真实数据源（已核实，不猜）：`_calib_result` 由
+        `_find_bobber_by_diff` 写入，结构为
+        {"x","y","w","h","area","median_rgb"}，x/y 本身就是局部坐标。
+        """
+        res = getattr(self.finder, "_calib_result", None)
+        if res and res.get("x") is not None and res.get("y") is not None:
+            try:
+                return (int(res["x"]), int(res["y"]))
+            except Exception:
+                return None
+        return None
+
     def detect_horizon(self):
         """自动测出「天空/水面分界线」的行号（不硬编码位置）。
 
@@ -166,9 +181,21 @@ class SinkCalibrator:
             # 平坦水面的噪声行上（y=625）。正确做法：先求每行三通道均值，
             # 再对行序列求一阶差分。
             row = b[:, :, :3].mean(axis=2).mean(axis=1)        # (h,) 每行亮度
+            # ★ v41：窗口边框纯色行会让梯度在边框边界爆表（实测 y=9）。
+            #   把这些行的亮度改写成 NaN，后面的中位数/argmax 自动跳过。
+            row = row.copy()
+            hb = b.shape[0]
+            rowa = b.reshape(hb, -1)
+            same = (rowa[:, 1:] == rowa[:, :-1]).all(axis=1)
+            limr = max(int(hb * 0.05), 12)
+            same[limr:] = False               # 只处理顶部 5%
+            if same.any():
+                row[same] = np.nan
             g = np.abs(np.diff(row))                           # (h-1,)
             grads.append(g)
         G = np.median(np.stack(grads, axis=0), axis=0)        # 取中位数抗水花
+        # NaN 传播后可能出现 NaN 峰值，统一转 0 避免 argmax 返回 NaN 下标
+        G = np.nan_to_num(G, nan=0.0)
 
         # 分界线搜索区间：从画面顶部（0）到 55%。
         # ⚠️ 实测本机：真海平面在截屏区上边界附近甚至其上方。
@@ -441,6 +468,14 @@ class SinkCalibrator:
           · 连续 3 帧检测不到就提前结束，不再空转采满。
         """
         self.points = []
+        # ★ v44：锚点只在本竿有效。用户明确：每一竿第一帧用浮标特征
+        #   确定锚点，之后每帧判断浮标相对本竿锚点的浮动差值；
+        #   咬钩后进入下一竿，锚点重新确定。
+        #   ⚠️ 每竿的浮标落点都不同（实测 21:24 落在局部 (608,236)），
+        #   绝不能跨竿复用上一竿坐标。这里记的只是「本竿标定期锚点」，
+        #   供第 1 竿标定结束后直接用，省掉重找那一步。
+        self.anchor = None          # 截屏区局部坐标 (x, y)
+        self.anchor_t = None
         origin = time.monotonic() if t_key is None else float(t_key)
         deadline = origin + float(self.seconds)
         interval = 1.0 / max(1.0, self.samples / float(self.seconds))
@@ -456,6 +491,31 @@ class SinkCalibrator:
             y, area, bmp = self._grab_and_locate()
             t = time.monotonic() - origin
             self.points.append((t, y, area, bmp))
+            # ★ v44：第一竿只标定，不判咬钩（用户明确要求）。
+            #   记录浮标特征（位置 + 面积）即可。
+            #   ⚠️ _calib_result 只在「差分标定成功」时写入，可能是上一竿的
+            #   旧值；用 y_src 校验：只有本轮 find() 返回的 y 与之吻合才采信，
+            #   否则退回用 find() 返回值配合搜索区偏移换算。
+            if y is not None and self.anchor is None:
+                cand = self._last_xy_local()
+                if cand is not None and abs(int(cand[1]) - int(y)) <= 2:
+                    self.anchor = (int(cand[0]), int(y))
+                else:
+                    try:
+                        p = self.finder.find()
+                    except Exception:
+                        p = None
+                    if p is not None:
+                        off = (0, 0)
+                        try:
+                            sa = self.screen.search_area()
+                            off = (int(sa[0]), int(sa[1]))
+                        except Exception:
+                            pass
+                        self.anchor = (int(p[0]) - off[0], int(p[1]) - off[1])
+                self.anchor_t = t
+                if self.anchor is not None:
+                    self.log("标定锚点(本竿): 局部 %s", tuple(self.anchor))
             i += 1
             self.log("标定采样 %02d t=%.1fs y=%s area=%s 检测=%s",
                      i, t, y, area, getattr(self, "_last_detect", "-"))
@@ -513,6 +573,26 @@ class SinkCalibrator:
         if len(seq) < 5:
             self.log("标定失败: 有效采样只有 %d 个（至少 5 个），沿用默认阈值", len(seq))
             return None
+
+        # ★ v43：先剔除「面积异常」的采样点，再做任何统计。
+        #   原逻辑只在算相邻位移时跳过跳变帧对，但那个异常点仍然留在 seq 里，
+        #   于是 ys 的 min/max 被它污染。真机实测：t=6.0s 浮标被咬走整帧消失，
+        #   locate 抓到一个 44px 的深红褐色噪点（area 176，正常 1100+），
+        #   y 从 413 跳到 425 → 日志报「最大净下沉 = 12px（疑似真咬钩）」，
+        #   但真相是浮标消失，不是下沉 12px。
+        med_area = float(np.median([a for (_t, _y, a) in seq if a])) if any(a for (_t, _y, a) in seq) else 0.0
+        if med_area > 0:
+            kept = []
+            for (t, y, a) in seq:
+                if a and a < med_area * 0.35:
+                    self.log("标定: 丢弃 t=%.1fs 的采样（面积 %d 远小于中位 %.0f，判为目标丢失而非下沉）",
+                             t, a, med_area)
+                    continue
+                kept.append((t, y, a))
+            if len(kept) >= 5:
+                seq = kept
+            else:
+                self.log("标定: 面积过滤后只剩 %d 点（<5），跳过面积过滤", len(kept))
 
         ys = [y for (_t, y, _a) in seq]
         areas = [a for (_t, _y, a) in seq]

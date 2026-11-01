@@ -42,6 +42,12 @@ class SearchBobberFinder:
         self.bobber_diff_enabled = True
         self.diff_threshold = 20          # R-B > 20 视为暖于水面
         self.diff_min_channel = 80        # R 下限，排除全暗噪声
+        # ★ v48：与色相无关的「局部亮团」判据，默认开启，与暖色判据取并集。
+        #   浮标在 WoW 里随环境光变色（暖橙/冷白/灰），只有「比周围水面亮、
+        #   边缘清晰成团」这一条在所有光线下都成立。
+        #   实测同一帧：浮标 dev>30 = 720px 峰值 126；最亮的水面反光 56px 峰值 50。
+        self.bobber_bright_enabled = True
+        self.bright_dev_threshold = 30.0  # 亮度 − 局部背景 > 30 视为亮团像素
         # 严格模式：色差检未命中时直接返回 None，不回落到原版差分/颜色搜索。
         # 实测原版回落路径在「画面上根本没有浮标」时会抓到暗红杂物，
         # 造成「浮标还在」的假象 → 上层反复认为没咬钩 / 误判。
@@ -60,6 +66,12 @@ class SearchBobberFinder:
         # 钓点会命中水面，实测带偏 670px）。
         self._diff_anchor = None
         self.diff_track_enabled = True
+        # ★ v43：首竿标定出的「浮标指纹」，后续每竿用它校验候选合法性。
+        #   真机实测教训：没有指纹时，顶部一条 area 1969~2423 的亮带
+        #   （比真浮标 360 大 6 倍）能冒充浮标被抓走；有了指纹，
+        #   面积/宽高/色值偏离基准的候选可被直接否决。
+        #   字段：area / w / h / rgb / frames（采样帧数）
+        self.bobber_fingerprint = None
         self.diff_anchor_sticky = True
         self.abort_cb = None
         self.excl_h = None                # find() 里会按实际帧尺寸刷新
@@ -83,6 +95,40 @@ class SearchBobberFinder:
         self.calib_pre = None            # 抛竿前截图
         self.calib_enabled = True
         self._calib_bmp = None           # post（_watch 最后一帧）
+
+    def learn_fingerprint(self, samples, log=None):
+        """★ v43：首竿标定成功后，从多帧采样学习「浮标指纹」。
+
+        samples: [(area, w, h, rgb)]，来自 _watch 跟踪期稳定命中的帧。
+        只取中位数，抗单帧噪声（真机有一次 area 从 1100 掉到 176）。
+        后续每竿 _find_points 用这份指纹否决明显不像浮标的候选。
+        """
+        if not samples or len(samples) < 5:
+            if log:
+                log("浮标指纹: 采样仅 %d 帧（需≥5），本竿不建指纹", len(samples or []))
+            return None
+        import statistics as _st
+        areas = [s[0] for s in samples if s[0]]
+        ws = [s[1] for s in samples if s[1]]
+        hs = [s[2] for s in samples if s[2]]
+        if not areas or not ws or not hs:
+            return None
+        fp = {
+            "area": int(_st.median(areas)),
+            "w": int(_st.median(ws)),
+            "h": int(_st.median(hs)),
+            "frames": len(samples),
+        }
+        # 颜色也取中位（有些帧 rgb 为 None）
+        rgbs = [s[3] for s in samples if s[3]]
+        if rgbs:
+            fp["rgb"] = tuple(int(_st.median([c[i] for c in rgbs])) for i in range(3))
+        self.bobber_fingerprint = fp
+        if log:
+            log("浮标指纹已建立: %dx%d area=%d rgb=%s（%d 帧采样）→ "
+                "后续每竿按此校验候选",
+                fp["w"], fp["h"], fp["area"], fp.get("rgb"), fp["frames"])
+        return fp
 
     def reset(self):
         # 逐行对应 SearchBobberFinder.cs:29-32
@@ -133,6 +179,17 @@ class SearchBobberFinder:
             # 之前没这个抑制，第一竿抛出去 0.7 秒就凑满 3 帧直接停机（实测日志）。
             if getattr(self, "suppress_abort", False):
                 self.previous_location = None
+                return None
+            # ★ v43 核心修复：_diff_hits > 0 说明已经看见候选、只是在攒连续性
+            #   确认帧。把它计入 no_bobber_frames 会导致「确认链一旦中断，
+            #   立刻烧掉 3 条命 → abort」。真机日志实测：帧1 1/3、帧2 2/3 各计
+            #   一次 miss，第 3 帧浮标恰好被咬走消失 → miss=3 → ABORT，
+            #   误报「本竿从未锁定浮标」—— 而那一刻其实正是鱼咬钩。
+            cf = getattr(self, "diff_confirm_frames", 1)
+            if self._diff_hits > 0 and self._diff_hits < cf:
+                self.previous_location = None
+                self.log("色差候选确认中（%d/%d），不计 miss",
+                         self._diff_hits, cf)
                 return None
             self.no_bobber_frames += 1
             if getattr(self, "strict_yellow", False):
@@ -198,6 +255,34 @@ class SearchBobberFinder:
         if self.previous_location is None:
             return None
         return self._to_screen(self.previous_location, bmp)
+
+    # ---- 非原版增强：窗口边框纯色行剔除（v41） ----
+    def _drop_uniform_rows(self, bmp):
+        """返回 bool 掩膜 (h,1)，True = 保留该行。None 表示无需处理。
+
+        实测本机 20:42 截屏区顶部：
+            y=0,1   整行 rgb(40,140,255)   1 种颜色
+            y=8     整行 rgb(40,140,255)   1 种颜色
+            y=9,10  整行 rgb(255,220,0)    1 种颜色
+            y=11+   142 种颜色（游戏画面）
+        整行只有 1 种颜色 = 合成色带（窗口边框），不可能是游戏内容。
+        不剔除的话 y=9,10 的 2560 个黄像素会被当成最大暖色块，
+        并把 detect_horizon 的梯度峰值顶到 y=9（实测日志「分界线y9」）。
+        """
+        try:
+            h = bmp.shape[0]
+            # 逐行唯一色数：把每行拉平成 (h, w*3) 后比较相邻像素
+            rowa = bmp.reshape(h, -1)
+            same = (rowa[:, 1:] == rowa[:, :-1]).all(axis=1)
+            keep = (~same).reshape(h, 1)
+            # 只在顶部 5% 内动手，避免误伤画面中真实的纯色水面带
+            lim = max(int(h * 0.05), 12)
+            if not keep[:lim].any():
+                return None                  # 顶部全被剔 = 异常帧，放弃
+            keep[lim:] = True
+            return keep
+        except Exception:
+            return None
 
     # ---- 非原版增强：色差浮标直检 ----
     def _bright_blob_mask(self, bmp):
@@ -270,16 +355,46 @@ class SearchBobberFinder:
         r = bmp[:, :, 0].astype(np.int16)
         b = bmp[:, :, 2].astype(np.int16)
         mask = ((r - b) > th) & (r > min_ch)
+        # ★ v41：先剔除「窗口边框纯色行」。
+        #   实测（2026-11-01 20:42 真机图）截屏区顶部是 WoW 窗口边框：
+        #     y=0,1  纯色 rgb(40,140,255)  蓝
+        #     y=9,10 纯色 rgb(255,220,0)   黄  ← 1280x2=2560 px，全被判成暖色
+        #   不剔的话这 2560px 是「最大暖色块」，而它又是逐行等宽的细横条，
+        #   会被下面的 bh<edge_min 规则挡掉，但同时把候选数从 1 撑到 2，
+        #   更糟的是它把 detect_horizon 的梯度峰值顶到 y=9。
+        #   判据：整行只有 1 种颜色 = 合成色带，不是游戏画面。
+        keep_rows = self._drop_uniform_rows(bmp)
+        if keep_rows is not None:
+            mask = mask & keep_rows
         # ★ v35：暖色判据只覆盖「红/橙/黄浮标」。实测冰冻之海钓点是**冷色浮标**：
         #   浮标 rgb(65,83,100)，周围水面 rgb(33,52,68) —— 三通道同步高 33/34，
         #   R-B = -35（和纯水面的 -35 一样），暖色判据恒不命中（mask 全 False）。
         #   但它比局部水面亮 33，局部背景偏离 dev=63，而水面只有 -8~+10。
         #   所以补一条**与色相无关的相对亮度判据**：亮度明显高于局部背景。
         #   浮标居水面之上、受光照，这条在所有钓点/水色下都成立。
-        if not mask.any() and getattr(self, "bobber_bright_enabled", False):
-            mask = self._bright_blob_mask(bmp)
-            if mask is None or not mask.any():
-                return None
+        # ★ v48：判据从「暖色方向」改为「暖色 OR 高对比亮团」并列命中。
+        #   原因：WoW 浮标颜色随环境光变化，同一次钓鱼里浮标的 R-B 可以是
+        #   +149px 的暖色块，也可以是 0px 的冷白块（真机实测两帧对比）。
+        #   把暖色当唯一判据，等于赌「这一竿的光线刚好合适」。
+        #   现在的 mask = 暖色像素 ∪ 亮度显著高于局部背景的像素：
+        #     暖色留下「黄昏偏橙」的浮标，亮团留下「清晨偏冷/正午偏白」的浮标，
+        #   两条都来自同一物理事实 —— 浮标是水面上受光的凸出小物体。
+        warm_mask = mask
+        bright_mask = None
+        if getattr(self, "bobber_bright_enabled", True):
+            try:
+                bright_mask = self._bright_blob_mask(bmp)
+            except Exception:
+                bright_mask = None
+        if bright_mask is not None and bright_mask.any():
+            if warm_mask is not None and warm_mask.any():
+                mask = warm_mask | bright_mask
+                self._log_once("v48 检测判据: 暖色∪亮团 合并生效")
+            else:
+                mask = bright_mask
+                self._log_once("v48 检测判据: 暖色无命中，改用亮团判据")
+        if not mask.any():
+            return None
         # ⚠️ 曾经加过 morph_close(r=4) 想修「浮标被鱼线切碎」，实测反而更糟：
         # 浮标右侧 30px 处有一团水面反光，颜色与浮标本体几乎一致，闭运算把
         # 两者连成一块，中心被拖偏 45px。不做闭运算时最大块就是浮标本体。
@@ -289,6 +404,11 @@ class SearchBobberFinder:
         sx = int(w * getattr(self, "exclude_side_ratio", 1.0 / 7.0))
         by = int(h * (1.0 - getattr(self, "exclude_bottom_ratio", 0.25)))
         lim = getattr(self, "sky_limit_y", None)
+        # ★ v43：地平线测不出时的兜底上边界（与 _drop_excluded 保持一致）。
+        #   真机实测：地平线 y=9 贴顶被判 UI 硬边 → lim=None → 顶部 y=16 的
+        #   80x34 亮带成为最大候选，把真浮标压掉。这里必须同样切掉顶部。
+        if lim is None and h:
+            lim = max(int(h * 0.06), 40)
         masks = getattr(self, "ui_masks", None) or []
         scale = w / 1280.0
         min_area = max(int(20 * scale * scale), 12)
@@ -309,6 +429,7 @@ class SearchBobberFinder:
                                mx2 * full_w - sa_l, my2 * full_h - sa_t))
         best = None
         n_ok = 0
+        n_fp_rej = 0
         for size, x0, y0, x1, y1, cx, cy in blocks:
             if size < min_area:
                 continue
@@ -330,6 +451,13 @@ class SearchBobberFinder:
                 continue                      # 太大 = 进度条/UI，不是浮标
             if bh > 0 and (bw / float(bh)) > 6.0:
                 continue                      # 细横条 = 地平线/UI 边框
+            # ★ v43：贴顶宽横条拦截。真机实测 21:17:38~40：一条 y=16、
+            #   80x34→95x34、横向匀速滑动、宽度随时间的亮带（窗口硬边/水面
+            #   反光）宽高比只有 2.35，逃过上面 6.0 的判据，area 1969~2423
+            #   比真浮标（~360）大一个量级，按面积排序必赢 → 锚点定错。
+            #   浮标不会贴着截图区顶边、也不会长得比它高 2 倍还宽。
+            if cy < max(int(80 * scale), 60) and bw > 40 * scale and bw > bh * 1.8:
+                continue                      # 贴顶宽横条 = UI 硬边/反光带
             # ★ v35：亮度判据下，天空/远山的亮边会成 684x2、594x2 这种「超宽
             #   极扁」的横条，面积动辄上千，按面积排序必然把真浮标压掉（实测
             #   真浮标只有 21x9/95px）。浮标是立体小物体，两个方向都得有几个
@@ -337,17 +465,35 @@ class SearchBobberFinder:
             edge_min = max(int(4 * scale), 3)
             if bh < edge_min or bw < edge_min:
                 continue
+            # ★ v43：浮标指纹校验。首竿标定成功后记下面积/宽高基准，
+            #   后续每竿拿候选跟基准比 —— 真机教训：顶部横带 area 1969~2423
+            #   是基准（~360）的 5~7 倍，宽高比也偏扁，一眼该否决。
+            #   放宽到 [0.3x, 3.0x] 面积区间 + 长宽比接近，避免因远近/缩放误杀。
+            fp = getattr(self, "bobber_fingerprint", None)
+            if fp and fp.get("frames", 0) >= 5:
+                fa = fp.get("area") or 0
+                if fa:
+                    r = size / float(fa)
+                    if r < 0.3 or r > 3.0:
+                        n_fp_rej += 1
+                        continue                  # 面积偏离基准太多
+                fr = (fp.get("w", 0) / float(fp.get("h") or 1))
+                cr = bw / float(bh)
+                if fr > 0 and (cr / fr > 2.2 or fr / cr > 2.2):
+                    n_fp_rej += 1
+                    continue                  # 长宽比形态不符
             n_ok += 1
             if best is None or size > best[0]:
                 best = (size, cx, cy, bw, bh)
         # v36：把本帧候选统计记下来，供日志/离线核对
         try:
             self._last_detect_note = (
-                "候选=%d 最佳=%s" % (
+                "候选=%d 最佳=%s%s" % (
                     n_ok,
                     "-" if best is None else
                     "%dx%d size=%d @(%d,%d)" % (best[3], best[4],
-                                                best[0], best[1], best[2])))
+                                                best[0], best[1], best[2]),
+                    (" 指纹否决%d" % n_fp_rej) if n_fp_rej else ""))
         except Exception:
             pass
         if best is None:
@@ -371,6 +517,7 @@ class SearchBobberFinder:
                 self.log("色差候选 (%d,%d) %dx%d 连续 %d/%d，等确认",
                          cx, cy, bw, bh, self._diff_hits, cf)
                 return None
+        self._last_block = (size, bw, bh)      # ★ v43：供首竿建「浮标指纹」
         self.log("色差浮标命中: (%d,%d) %dx%d area=%d (连续 %d 帧)",
                  cx, cy, bw, bh, size, getattr(self, "_diff_hits", 1))
         return (int(cx), int(cy))
@@ -476,6 +623,18 @@ class SearchBobberFinder:
                 pass
             return None
         # 用实测色值放宽 tan 判据（只放宽，不收紧：取两者较松的一侧）
+        # ★ v43：放宽前先自检。真机实测选中过 rgb=(41,59,75) 的水面块，
+        #   sig = signature_from 会算出 tan_min_rb = max(41-75, 8) = 8，
+        #   而原值是 20 —— 直接把判据从 R-B>20 放宽到 R-B>8，
+        #   后续整竿都在抓水面。所以：差分结果本身必须是暖色方向才允许放宽。
+        mr, mg, mb = [int(v) for v in res["median_rgb"]]
+        if mr - mb <= 5:
+            self.log("差分标定否决: (%d,%d) %dx%d rgb=(%d,%d,%d) R-B=%d 非暖色方向，"
+                     "判为水面波动/天空，不采信",
+                     res["x"], res["y"], res["w"], res["h"], mr, mg, mb, mr - mb)
+            self.calib_pre = None
+            self._calib_bmp = None
+            return None
         c = self.pixel_classifier
         sig = bc.signature_from(res["median_rgb"])
         c.tan_min_red = min(c.tan_min_red, sig["tan_min_red"])
@@ -615,7 +774,15 @@ class SearchBobberFinder:
         if limit is not None:
             y0 = limit
         else:
-            y0 = int(h * self.exclude_top_ratio) if h else None
+            # ★ v43：地平线测不出时的兜底上边界。
+            #   真机实测 21:17:17：地平线候选 y=9 太贴顶被判「窗口 UI 硬边」，
+            #   sky_limit_y=None → 上边界 0（完全不排除）。结果画面顶部一条
+            #   y=16、80x34、匀速横滑的亮带（窗口硬边/水面反光）成了唯一候选，
+            #   把真浮标 (548,235) 压掉，锚点定错 → 3 帧 miss 停机。
+            #   兜底取 h*0.06（801 高 → 48px）：足够切掉顶部硬边，又不会
+            #   误伤从第 2 行起的浮标（min_horizon_conf 那段注释里的顾虑）。
+            if h:
+                y0 = max(int(h * 0.06), 40)
         y1 = int(h * (1.0 - self.exclude_bottom_ratio)) if h else None
 
         if x0 is None:

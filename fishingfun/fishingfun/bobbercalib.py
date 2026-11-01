@@ -377,7 +377,39 @@ def pick_bobber(pre, post, log=None, align=True):
             log("差分标定失败: %d 个变化块全被筛掉" % len(blocks))
         return None
 
-    # 按面积降序，第一个优先（浮标通常是画面里最显眼的新增暖色块）
+    # ★ v43 核心修复：v23 用 `if False and ...` 把暖色过滤整个关掉后，
+    #   pick_bobber 退化成「取变化区里面积最大的块」。真机实测（21:17:25）：
+    #   水面波动合成的大块 61x59 area=1685 rgb=(41,59,75)（R-B=-34，深蓝）
+    #   压过真浮标 26x16 area≈360 rgb≈(214,180,134)。结果整竿拿一个水面块
+    #   当锚点，而色差搜索明明在同一帧稳定命中 (548,235)。
+    #
+    #   不恢复固定色阈值（那会被"换钓点浮标变暗"打脸），改为「色彩方向」筛选：
+    #   浮标在游戏里恒为暖色（R>B），水面波动/天空恒为冷色（B>R）。这是相对
+    #   判据，与绝对亮度无关，既抗光照变化又能剔除水面块。
+    def _warm_dir(block):
+        _s, _cx, _cy, _bw, _bh, _f = block
+        _p = post[max(_cy - _bh // 2, 0):_cy + _bh // 2 + 1,
+                  max(_cx - _bw // 2, 0):_cx + _bw // 2 + 1]
+        if not _p.size:
+            return 0.0
+        _m = np.median(_p.reshape(-1, 3), axis=0)
+        return float(_m[0]) - float(_m[2])          # R - B，正=暖色
+
+    warm_ok = [b for b in ok if _warm_dir(b) > 5]
+    if warm_ok:
+        if log and len(warm_ok) < len(ok):
+            log("差分: %d 个候选中 %d 个为暖色方向（R>B），优先在暖色候选里挑",
+                len(ok), len(warm_ok))
+        ok = warm_ok
+    else:
+        # 一个暖色候选都没有 → 这一帧里没有可信浮标。宁可失败退回颜色搜索，
+        # 也不要把水面块封成「本竿固定锚点」。
+        if log:
+            log("差分标定失败: %d 个候选全是冷色（R-B<=5），判为水面波动，"
+                "不采信（退回颜色搜索）", len(ok))
+        return None
+
+    # 按面积降序，第一个优先（暖色候选里浮标通常是面积最大的那块）
     ok.sort(key=lambda t: -t[0])
     size, cx, cy, bw, bh, fill = ok[0]
     patch = post[max(cy - bh // 2, 0):cy + bh // 2 + 1,

@@ -48,6 +48,18 @@ class PositionBiteWatcher:
         self._streak = 0                    # 连续超过阈值的帧数
         self._vanish = 0                    # 连续未检测到浮标的帧数
 
+        # ★ v44：每竿重新锚定模式。见 _is_bite_robust 里的说明。
+        #   per_cast_anchor_mode=False 时行为与 v43 完全一致（可回退）。
+        self.per_cast_anchor_mode = False
+        self.per_cast_anchor_y = None          # 本竿第一帧的 y（每竿重置）
+        self.per_cast_anchor_xy = None         # ★ v45：本竿锚点 (x,y)，便于日志对号入座
+        self.log = lambda *a, **k: None     # 由 FishBot 注入
+
+        # ★ v45：逐帧明细日志（调试用，输出量很大，默认关闭）。
+        #   开启后每帧一行：t / 检测坐标 / 当前 y / 相对锚点下沉值 / 阈值。
+        #   用户要求「每一秒的标定值都进日志」，靠这一项复盘浮标怎么动的。
+        self.frame_log = False
+
         # ★ v37：抖动自适应阈值
         #   实测（2560x1600 真图 16 帧）：平静期 y 抖动只有 1px 下沉，
         #   但换钓点/换分辨率后会变。原固定 strike=4 一旦低于真实抖动就
@@ -79,6 +91,9 @@ class PositionBiteWatcher:
         self._noise_samples.clear()      # v37：每竿重新学抖动
         self.effective_strike = int(self.strike_value)
         self._last_delta = None          # v37：连续下沉判据的上帧值
+        # ★ v44：每竿清空锚点 —— 锚点必须是「本竿第一帧」的 y，跨竿复用必错
+        self.per_cast_anchor_y = None
+        self.per_cast_anchor_xy = None
 
         self.timer = TimedAction(
             lambda a: self.raise_event({"Amplitude": self.y_diff, "Action": "BobberMove"}),
@@ -175,6 +190,46 @@ class PositionBiteWatcher:
 
         self._vanish = 0
         y = int(current_bobber_position[1])
+
+        # ★ v44：每竿重新锚定（用户指定的判定逻辑）。
+        #   「每一竿，第一帧，根据浮标特征确定锚点；后面每一帧，判断浮标
+        #    和锚点的上下浮动差值，≥ 第一竿标定的咬钩特征值就判咬钩。」
+        #
+        #   ⚠️ 锚点是「本竿」的浮标位置，不是跨竿固定坐标：
+        #      每抛一竿浮标落点都不同（实测 21:24 那竿落在局部 (608,236)），
+        #      所以 reset() 每次都清空 anchor_y，用本竿第一帧的 y 重新定。
+        #      跨竿复用上一竿的坐标必然全错。
+        #
+        #   与下面的 v37 自适应基线互斥：那种基线取「近 N 帧中位数」，
+        #   会随水面/浮标漂移不断移动，慢慢漂远时基准跟着跑，真咬钩的
+        #   下沉量被抵消掉。这里整竿只有一个参照点。
+        #   y_diff 语义与原版一致：负数 = 下沉，正数 = 上浮。
+        if getattr(self, "per_cast_anchor_mode", False):
+            if self.per_cast_anchor_y is None:
+                self.per_cast_anchor_y = y
+                self.per_cast_anchor_xy = (int(current_bobber_position[0]), y)
+                self.log("本竿锚点: (x=%d, y=%d)（本竿第一帧，后续整竿以此为参照，"
+                         "阈值=%dpx）",
+                         int(current_bobber_position[0]), y,
+                         int(self.strike_value))
+            self.y_diff = self.per_cast_anchor_y - y
+            # ★ v45：逐帧明细。用户要「每帧/每秒的浮动值」都能在日志里查到，
+            #   否则出现误判时无从复现。只在 frame_log 开启时输出。
+            if getattr(self, "frame_log", False):
+                self.log("浮动值: t帧 y=%d 锚点y=%d yDiff=%d 下沉=%dpx 阈值=%dpx 命中=%s",
+                         y, self.per_cast_anchor_y, self.y_diff, -self.y_diff,
+                         int(self.strike_value),
+                         "是" if -self.y_diff >= int(self.strike_value) else "否")
+            if -self.y_diff >= int(self.strike_value):
+                self._streak += 1
+                self.log("锚点判定: 锚点 y=%d 当前 y=%d 下沉 %dpx ≥ 阈值 %d（连续 %d）",
+                         self.per_cast_anchor_y, y, -self.y_diff,
+                         int(self.strike_value), self._streak)
+                if self._streak >= max(1, int(getattr(self, "confirm_frames", 1))):
+                    return self._fire()
+            else:
+                self._streak = 0
+            return False
 
         # ★ v37：水位基线用「稳健上沿」而不是中位数。
         #   中位数会被水面的上下波动带跑：±5px 抖动时中位数也在 ±5px 里晃，
