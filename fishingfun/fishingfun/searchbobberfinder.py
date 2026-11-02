@@ -29,6 +29,14 @@ class SearchBobberFinder:
         # 天空/水面分界线（标定时用 17 帧自动测出）。设了就只在水面侧找浮标。
         # 浮标不可能在天上 —— 少了这条，云影/飞鸟/天空色块经常被当成候选。
         self.sky_limit_y = None
+        # ★ v58：面积历史必须在 __init__ 就建好。
+        #   reset() 里才初始化的话，任何「没先调 reset() 就直接用」的路径
+        #   （离线回放、先 find() 后 reset()、外部把 finder 对象复用）
+        #   都会在 _find_bobber_by_diff 命中后崩在
+        #     self._area_hist.append(...)  → AttributeError
+        #   离线回归实测：40 帧里 18 帧死在这里，而 area_decayed() 早就
+        #   用 getattr(..., []) 兜底过，说明这本来就是该有的契约。
+        self._area_hist = []      # 本竿面积历史，(time, area)
         # 非原版：排除区（用户指定）。左右各 1/7 是 UI（小地图/头像/聊天框），
         # 上边界不硬编码，改用标定测出的天空分界线 sky_limit_y；下 1/4 是技能条。
         self.exclude_side_ratio = 1.0 / 7.0
@@ -67,6 +75,9 @@ class SearchBobberFinder:
         # v37：色差锚点 & 后续帧优先用色差跟踪（TAN 在水面色彩相近的
         # 钓点会命中水面，实测带偏 670px）。
         self._diff_anchor = None
+        # ★ v58：_diff_hits 原先只在 reset() 里初始化（与 _area_hist 同类 bug）。
+        #   首次 find() 走到「色差确认链」分支就 AttributeError（实测复现）。
+        self._diff_hits = 0
         self.diff_track_enabled = True
         # ★ v43：首竿标定出的「浮标指纹」，后续每竿用它校验候选合法性。
         #   真机实测教训：没有指纹时，顶部一条 area 1969~2423 的亮带
@@ -257,7 +268,11 @@ class SearchBobberFinder:
             # 飞行期 / 标定期不算失败：浮标还在空中或刚落水，本来就可能找不到。
             # 之前没这个抑制，第一竿抛出去 0.7 秒就凑满 3 帧直接停机（实测日志）。
             if getattr(self, "suppress_abort", False):
-                self.previous_location = None
+                # ★ v58：不清空锚点。真机证据（c001 第1竿）：咬钩阶段浮标离开画面，
+                #   每帧 miss 都把锚点清成 None → 下一帧就近门限形同虚设 →
+                #   候选按面积排序乱选，(619,340)/(572,315)/(489,351) 全报成浮标
+                #   （真浮标在 (268,150)）。锚点必须留着当「最后已知位置」，
+                #   给就近门限和 yDiff 基线用；它是否有效由上层 _diff_hits 判断。
                 return None
             # ★ v43 核心修复：_diff_hits > 0 说明已经看见候选、只是在攒连续性
             #   确认帧。把它计入 no_bobber_frames 会导致「确认链一旦中断，
@@ -266,13 +281,14 @@ class SearchBobberFinder:
             #   误报「本竿从未锁定浮标」—— 而那一刻其实正是鱼咬钩。
             cf = getattr(self, "diff_confirm_frames", 1)
             if self._diff_hits > 0 and self._diff_hits < cf:
-                self.previous_location = None
+                # ★ v58：确认链中断同样保留锚点 —— 否则「看见候选→确认失败→清空锚点」
+                #   会把这竿的定位彻底打散，后面每帧都是全图乱选。
                 self.log("色差候选确认中（%d/%d），不计 miss",
                          self._diff_hits, cf)
                 return None
             self.no_bobber_frames += 1
             if getattr(self, "strict_yellow", False):
-                self.previous_location = None
+                # ★ v58：同上，miss 时保留锚点（见上一条 v58 说明）。
                 self.log("色差检未命中（%d/%d），不回落到原版搜索 -> None",
                          self.no_bobber_frames, self.no_bobber_limit)
                 if (self.abort_cb is not None
@@ -303,6 +319,29 @@ class SearchBobberFinder:
                 self._diff_anchor = yb
                 self.bitmap_event(yb, bmp)
                 return self._to_screen(yb, bmp)
+
+        # ★ v58 核心修复（C）：暖色像素为 0 时，禁止 TAN 兜底路径接管。
+        #   真机证据（c001 第1竿 t19.8s，720x456@360,190）：
+        #     全帧 R-B>20 像素数 = 0，R-B>10 也是 0 —— 浮标确实不在画面里；
+        #     _find_bobber_by_diff 也正确返回 None。
+        #     但后续 TAN 路径（只看形状+亮度、不看颜色）却选中了
+        #     16x13 size=118 @(297,386) 一块蓝灰水面（块均值 RGB(70,96,120)，
+        #     R-B=-49.6，连「微暖」都算不上），报成浮标。
+        #   这个误报会直接污染 yDiff：锚点 (268,150) → 误报 (297,386)，
+        #   dy=+236，远超 strike_value（个位到几十像素）→ 假咬钩、空提竿。
+        #   暖色判据在本钓点已被验证为干净判据（真浮标 R-B=+49~+57，
+        #   水面 -32~-49，全图暖色像素要么 0 要么就是浮标本体），
+        #   所以「暖色为 0」应当直接判「本帧无浮标」，而不是让 TAN 硬凑一个。
+        _im = bmp.astype("int16")
+        _warm_n = int(((_im[:, :, 0] - _im[:, :, 2]) > 20).sum())
+        if _warm_n == 0:
+            self._yellow_miss = True
+            self.no_bobber_frames += 1
+            self.log("暖色像素为 0，判本帧无浮标（不放行 TAN 兜底）")
+            if (self.abort_cb is not None
+                    and self.no_bobber_frames >= self.no_bobber_limit):
+                self.abort_cb(self.no_bobber_frames)
+            return None
 
         pts = self._find_points(bmp)
         pts = self._drop_excluded(pts, bmp)
@@ -596,6 +635,22 @@ class SearchBobberFinder:
             edge_min = max(int(4 * scale), 3)
             if bh < edge_min or bw < edge_min:
                 continue
+            # ★ v58：浮标最小「像样尺寸」下限。
+            #   真机证据（debug.zip c001，720x456@360,190）：咬钩阶段浮标已离开
+            #   画面（暖色像素 = 0），亮团兜底路径于是把水面噪点当成浮标：
+            #     t18.8s 11x3 size=29 @(285,173)
+            #     t19.8s 17x4 size=41 @(284,182)
+            #     t20.3s  7x3 size=13 @(275,184)
+            #   这些块高只有 3~4px、面积 13~41，而本竿真浮标是 21x13 size=200~226。
+            #   原 min_area 只有 12（20*scale²，本帧 scale=0.56 → 12）根本挡不住。
+            #   更糟的是 v57 的就近门限把 44/35/40 个真候选全淘汰成「跳远」，
+            #   只剩这些贴着锚点的噪点活下来 —— 门限反而帮了噪点的忙。
+            #   浮标是个立体小物体，短边不可能只有 3px；按 1280 宽归一取
+            #   ≥8px 短边 + ≥60 面积（真机最小浮标 18x10=148、21x12=200，留足余量）。
+            if bh < max(int(8 * scale), 6) or bw < max(int(8 * scale), 6):
+                continue
+            if size < max(int(60 * scale * scale), 40):
+                continue
             # ★ v43：浮标指纹校验。首竿标定成功后记下面积/宽高基准，
             #   后续每竿拿候选跟基准比 —— 真机教训：顶部横带 area 1969~2423
             #   是基准（~360）的 5~7 倍，宽高比也偏扁，一眼该否决。
@@ -655,6 +710,7 @@ class SearchBobberFinder:
                         or abs(cy - prev_loc[1]) > _gate):
                     n_far += 1
                     continue
+
             # 排序键：指纹吻合优先，其次面积大
             score = size * (1.0 + 0.25 * bonus)
             if best is None or score > best[0]:
@@ -681,6 +737,19 @@ class SearchBobberFinder:
         # 反光块每帧乱跳。所以要求「同位置连续 confirm_frames 帧命中」。
         cf = getattr(self, "diff_confirm_frames", 1)
         cc = getattr(self, "diff_confirm_dist", 12)
+        # ★ v58：单候选免多帧确认。
+        #   多帧确认的本意是「水面反光块颜色和真浮标几乎一样，只能靠位置
+        #   连续性区分」—— 前提是候选里有多个竞争块。当整帧只筛出 1 个候选时，
+        #   没有竞争对象，多帧确认只是白白拖时间、甚至让浮标消失后再也锁不上。
+        #   真机证据（c001 第1竿，720x456@360,190，diff_confirm_frames=3）：
+        #     t1.8s 候选=1 21x13 size=226 @(268,150)  ← 真浮标，唯一候选
+        #     t17.8s 候选=1 21x12 size=200 @(268,150) ← 同一位置，唯一候选
+        #     两帧之间隔了 16 秒（浮标在水面静止），中间没有任何可见帧，
+        #     3 帧连续确认永远凑不满 → 第1竿整竿 0 命中。
+        #   暖色掩膜本身已经把鱼线/水面反光滤干净（这两帧暖色像素 315/275，
+        #   恰好就是浮标本体），唯一候选即高置信。
+        if n_ok <= 1:
+            cf = 1
         if cf > 1 and not single_frame:
             prev = getattr(self, "_diff_prev", None)
             if (prev is not None
