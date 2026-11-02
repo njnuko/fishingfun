@@ -11,6 +11,7 @@
 import time
 
 from .timedaction import TimedAction
+from . import __version__ as _PKG_VERSION
 
 # 原版 ConsoleKey 枚举里 0x34='4'、0x35='5'、0x20=Space
 VK_SPACE = 0x20
@@ -59,8 +60,23 @@ class FishingBot:
         self._area_armed_done = False   # 首竿标定截屏边界只做一次
         # ★ v45：日志/截图增强（用户要求每竿可复盘）
         self.save_regions = False   # True = 每竿锚定/咬钩/重抛都存区域图
+        # ★ v55：关键节点取证（区域图+红框 / 全屏图+红框 / 特征值txt）
+        #   用户要求：首竿浮标特征+咬钩特征、每竿浮标截图+咬钩图+咬钩特征值、
+        #   每竿完整全屏截图（供离线调试）。
+        self.forensic = False
+        self._is_first_cast = False
         self.frame_log = False      # True = 判咬钩循环每帧输出浮动值一行
         self.trace_seconds = 1.0    # 每竿前 N 秒逐秒存区域图（0=关）
+        # ★ v55：debug 图按秒节流（用户要求「每秒存一次就行」）。
+        #   判咬钩循环约 14fps（检测 21ms + sleep 50ms），每帧都存要多花
+        #   40ms/帧 落盘，帧率腰斩 → 咬钩那 3~7 帧可能被跳过。
+        self.save_interval_sec = 1.0     # 普通帧：1 秒 1 张
+        self.critical_tags = ("咬钩", "锚定", "首竿标定", "重抛", "咬钩衰减")
+        self._last_dump_t = 0.0
+        self._last_dump_cast = None
+        self._dump_skipped = 0
+        self._dense_dump = False         # True = 咬钩前后密集段（200ms 1 张）
+        self.keep_debug_casts = 20       # 只保留最近 N 竿的帧图（0=不限）
         # ★ v49：可恢复停机（只结束本轮，不退出主循环）+ 第 N 竿标定保护
         self._soft_stop = False
         self.soft_stop_pause = 0.35
@@ -131,6 +147,15 @@ class FishingBot:
         while self.is_enabled:
             try:
                 self._cast_no += 1
+                # ★ v55：首竿标记 —— 取证文件名带「首竿_」，一眼找到首竿特征
+                self._is_first_cast = (self._cast_no == 1)
+                # ★ v55：按秒存图后一竿约 20~40 张，跑一天几百竿会堆到几十 GB。
+                #   这里只保留最近 keep_debug_casts 竿（默认 20 竿，约 600MB）
+                #   的帧图，更早的连同 timeline 记录一起删；日志文件不动。
+                try:
+                    self._prune_debug_frames()
+                except Exception as _pe:
+                    self.log("debug 帧清理异常 %s", _pe)
                 self.log("Pressing key %s to Cast.", self.cast_key)
                 # 非原版：抛竿前先把光标移到屏幕边缘，避免鼠标悬停在抛竿点附近
                 # 挡住浮标 / 弹出悬停提示干扰判定
@@ -556,19 +581,379 @@ class FishingBot:
         # 不超过指纹面积本身 —— 否则一旦系数定错就永远过不了
         return min(need, target)
 
+    # ================= ★ v55 关键节点取证 =================
+    # 用户要求：把「关键节点数据」落到日志里，不只写一行文字，要能事后离线复盘：
+    #   1. 首竿拿到的浮标特征 + 咬钩特征（区域图 + 浮标处红框）
+    #   2. 之后每竿的浮标截图（区域图 + 红框）+ 咬钩图 + 咬钩特征值
+    #   3. 每竿一张完整全屏截图（含 UI），用于离线调试比对
+    #
+    # 命名统一为（一竿一组，按竿号排序即可按时序读）：
+    #   c001_首竿_锚定_区域_720x436@360,210_t1.2s_104841.bmp   区域图+红框
+    #   c001_首竿_锚定_全屏_1440x900_104841.bmp               全屏图+红框
+    #   c001_首竿_锚定_特征_104841.txt                        特征值纯文本
+    #   c001_咬钩_区域_... / c001_咬钩_全屏_... / c001_咬钩_特征_...
+    # 红框画在「浮标外接矩形外扩 4px」处；全屏图上的框用屏幕坐标，区域图用局部坐标。
+
+    FORENSIC_BOX_PAD = 4          # 红框相对浮标外接矩形外扩的像素
+
+    def _forensic_dir(self):
+        import os
+        d = os.path.join(os.getcwd(), self._debug_dir or "debug")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _grab_fullscreen(self):
+        """抓一张完整全屏（含 UI）。返回 HxWx3 RGB；失败返回 None。"""
+        try:
+            import mss
+            import numpy as np
+            with mss.mss() as sct:
+                mon = sct.monitors[1]
+                raw = sct.grab(mon)
+            arr = np.frombuffer(bytes(raw.raw), np.uint8)
+            arr = arr.reshape(raw.height, raw.width, 4)[:, :, 2::-1]
+            return np.ascontiguousarray(arr), (int(mon["left"]), int(mon["top"]))
+        except Exception as e:
+            self.log("全屏截图失败 %s", e)
+            return None, (0, 0)
+
+    @staticmethod
+    def _draw_box(img, box, color=(255, 40, 40), pad=4, width=2, label=None):
+        """在 PIL Image 上画红框。box=(x0,y0,x1,y1) 会自动外扩 pad。"""
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(img)
+        if box is None:
+            return img
+        x0, y0, x1, y1 = [int(v) for v in box]
+        x0, y0 = x0 - pad, y0 - pad
+        x1, y1 = x1 + pad, y1 + pad
+        W, H = img.size
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(W - 1, x1), min(H - 1, y1)
+        draw.rectangle([x0, y0, x1, y1], outline=color, width=width)
+        if label:
+            # 标签画在框上方，越界则画在框内左上
+            ty = y0 - 12 if y0 >= 14 else y0 + 2
+            draw.text((x0 + 1, ty), label, fill=color)
+        return img
+
+    def _save_forensic(self, tag, cast_no, bmp_region=None, box_local=None,
+                       box_screen=None, features=None, also_fullscreen=True,
+                       stamp=None):
+        """★ v55：统一的「关键节点取证」入口。
+
+        一次性落三样东西（同一竿同一时刻共用同一个 stamp，文件名天然对齐）：
+          · <区域图>   bmp_region 或现场 grab()，浮标处画红框（局部坐标）
+          · <全屏图>   mss 整屏，浮标处画红框（屏幕坐标）
+          · <特征txt>  features 字典逐行写出（人类可读，含坐标换算关系）
+
+        box_local / box_screen 可只给一个；只给 box_screen 时按截屏区原点反算局部框。
+        返回 (区域文件名, 全屏文件名, 特征文件名)。
+        """
+        import os
+        from PIL import Image
+
+        if not (getattr(self, "forensic", False)
+                or getattr(self, "save_regions", False)
+                or getattr(self, "debug_frames", False)):
+            return (None, None, None)
+
+        d = self._forensic_dir()
+        stamp = stamp or time.strftime("%H%M%S")
+        cast_no = cast_no if cast_no is not None else self._cast_no
+        # 首竿额外打标记，方便一眼找到「首竿特征」
+        pre = "首竿_" if getattr(self, "_is_first_cast", False) else ""
+
+        g = getattr(self.bobber_finder, "grabber", None)
+        l = t = 0
+        try:
+            if g is not None:
+                sa = g.search_area()
+                l, t = int(sa[0]), int(sa[1])
+        except Exception:
+            pass
+
+        # 只有屏幕框时反算局部框
+        if box_local is None and box_screen is not None:
+            box_local = (box_screen[0] - l, box_screen[1] - t,
+                         box_screen[2] - l, box_screen[3] - t)
+        if box_screen is None and box_local is not None:
+            box_screen = (box_local[0] + l, box_local[1] + t,
+                          box_local[2] + l, box_local[3] + t)
+
+        region_name = full_name = feat_name = None
+        elapsed = ""
+        if getattr(self, "_last_cast_t", None):
+            elapsed = "_t%.1fs" % (time.monotonic() - self._last_cast_t)
+
+        # 1) 区域图 + 红框
+        try:
+            if bmp_region is None and g is not None:
+                bmp_region = g.grab()
+            if bmp_region is not None:
+                h, w = bmp_region.shape[0], bmp_region.shape[1]
+                img = Image.fromarray(bmp_region).convert("RGB")
+                cx = None
+                if box_local is not None:
+                    cx = ((box_local[0] + box_local[2]) // 2,
+                          (box_local[1] + box_local[3]) // 2)
+                label = "BOBBER %d,%d" % cx if cx else None
+                self._draw_box(img, box_local, pad=self.FORENSIC_BOX_PAD,
+                               label=label)
+                region_name = "c%03d_%s%s_区域_%dx%d@%d,%d%s_%s.bmp" % (
+                    cast_no, pre, tag, w, h, l, t, elapsed, stamp)
+                img.save(os.path.join(d, region_name))
+                self.log("取证[%s] 区域图 debug/%s  红框=局部%s 屏幕%s",
+                         tag, region_name, box_local, box_screen)
+        except Exception as e:
+            self.log("取证[%s] 区域图失败 %s", tag, e)
+
+        # 2) 全屏图 + 红框（屏幕坐标）
+        if also_fullscreen:
+            try:
+                arr, (mx, my) = self._grab_fullscreen()
+                if arr is not None:
+                    img = Image.fromarray(arr).convert("RGB")
+                    bx = box_screen
+                    if bx is not None and (mx or my):
+                        bx = (bx[0] - mx, bx[1] - my, bx[2] - mx, bx[3] - my)
+                    self._draw_box(img, bx, pad=self.FORENSIC_BOX_PAD,
+                                   label="BOBBER(screen)")
+                    full_name = "c%03d_%s%s_全屏_%dx%d%s_%s.bmp" % (
+                        cast_no, pre, tag, arr.shape[1], arr.shape[0],
+                        elapsed, stamp)
+                    img.save(os.path.join(d, full_name))
+                    self.log("取证[%s] 全屏图 debug/%s", tag, full_name)
+            except Exception as e:
+                self.log("取证[%s] 全屏图失败 %s", tag, e)
+
+        # 3) 特征值 txt
+        if features:
+            try:
+                feat_name = "c%03d_%s%s_特征_%s.txt" % (cast_no, pre, tag, stamp)
+                lines = ["# FishingFun %s 关键节点特征" % _PKG_VERSION,
+                         "时间: %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+                         "竿号: %d  %s" % (cast_no, "（首竿）" if pre else ""),
+                         "节点: %s" % tag,
+                         "区域图: %s" % region_name,
+                         "全屏图: %s" % full_name,
+                         "截屏区: %dx%d @ (%d,%d)" % (
+                             (bmp_region.shape[1], bmp_region.shape[0], l, t)
+                             if bmp_region is not None else (0, 0, l, t)),
+                         "浮标框(局部): %s" % (box_local,),
+                         "浮标框(屏幕): %s" % (box_screen,),
+                         "坐标换算: 屏幕 = 局部 + (%d,%d)" % (l, t),
+                         "-" * 60]
+                for k, v in features.items():
+                    if isinstance(v, (list, tuple)):
+                        v = ", ".join(str(x) for x in v)
+                    lines.append("%-14s = %s" % (k, v))
+                with open(os.path.join(d, feat_name), "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+                self.log("取证[%s] 特征 debug/%s", tag, feat_name)
+                # 同时把关键值直接打进日志，不看文件也能核对
+                self.log("取证[%s] 特征值: %s", tag,
+                         " | ".join("%s=%s" % (k, v) for k, v in features.items()))
+            except Exception as e:
+                self.log("取证[%s] 特征写入失败 %s", tag, e)
+
+        return (region_name, full_name, feat_name)
+
+    def _anchor_features(self, cand_local, cand_screen):
+        """★ v55：采集一根竿此刻的「浮标特征」字典（用于 txt + 日志）。
+
+        字段全部来自 finder 真实存在的属性（2026-11-02 核对过）：
+          · _last_block = (面积, 宽, 高)   —— 最后一次命中候选的尺寸
+          · _last_detect_note = "候选=N 最佳=WxH size=A @(x,y)"
+          · bobber_fingerprint = {area,w,h,rgb,frames} —— 首竿学到的指纹
+        """
+        bf = self.bobber_finder
+        h = w = 0
+        try:
+            b = getattr(bf, "_calib_bmp", None) or getattr(bf, "last_bmp", None)
+            if b is not None:
+                h, w = b.shape[0], b.shape[1]
+        except Exception:
+            pass
+        feats = {
+            "浮标局部坐标": cand_local,
+            "浮标屏幕坐标": cand_screen,
+        }
+        blk = getattr(bf, "_last_block", None)
+        if blk:
+            try:
+                feats["浮标面积"], feats["浮标宽"], feats["浮标高"] = (
+                    int(blk[0]), int(blk[1]), int(blk[2]))
+                feats["填充率"] = round(float(blk[0]) / max(1, blk[1] * blk[2]), 3)
+            except Exception:
+                feats["浮标尺寸"] = blk
+        note = getattr(bf, "_last_detect_note", "")
+        if note:
+            feats["本帧检测"] = note
+        fp = getattr(bf, "bobber_fingerprint", None)
+        if fp:
+            feats["指纹"] = "%dx%d area=%d rgb=%s (%d帧)" % (
+                fp.get("w", 0), fp.get("h", 0), fp.get("area", 0),
+                fp.get("rgb"), fp.get("frames", 0))
+        else:
+            feats["指纹"] = "未建立（本竿即首竿）"
+        if w and h:
+            feats["截屏区"] = "%dx%d" % (w, h)
+        return feats
+
+    def _bite_features(self, current, anchor_screen, reason=None):
+        """★ v55：采集咬钩瞬间的「咬钩特征值」。"""
+        bw = self.bite_watcher
+        feats = {
+            "咬钩判据": reason or "?",
+            "本竿锚点(屏幕)": anchor_screen,
+            "当前浮标": current if current is not None else "已消失",
+            "strike_value": getattr(bw, "strike_value", "?"),
+            "effective_strike": getattr(bw, "effective_strike", "?"),
+            "y_diff": getattr(bw, "y_diff", "?"),
+        }
+        ay = getattr(bw, "per_cast_anchor_y", None)
+        if ay is not None:
+            feats["本竿锚点y"] = ay
+            if current is not None:
+                feats["实际下沉px"] = int(ay - current[1])
+        try:
+            feats["面积衰减"] = self.bobber_finder.area_decayed()
+        except Exception:
+            pass
+        yp = getattr(bw, "y_positions", None)
+        if yp:
+            feats["最近y序列"] = [int(v) for v in list(yp)[-12:]]
+        return feats
+
+    def _forensic_bite(self, current, anchor_screen, reason):
+        """★ v55：咬钩节点取证（区域图+红框 / 全屏+红框 / 咬钩特征值）。
+
+        current=None 表示浮标已消失（面积衰减式咬钩），此时红框画在
+        本竿锚点位置 —— 那里正是刚刚消失的浮标，框住它才有意义。
+        """
+        try:
+            blk = getattr(self.bobber_finder, "_last_block", None)
+            # 注意：current 已是屏幕坐标（finder 返回屏幕坐标），
+            # 所以这里只给 box_screen，由 _save_forensic 反算局部框，避免再次坐标错配。
+            if current is not None and blk and len(blk) >= 3:
+                bw, bh = int(blk[1]), int(blk[2])
+                box_screen = (current[0] - bw // 2, current[1] - bh // 2,
+                              current[0] + bw // 2, current[1] + bh // 2)
+            else:
+                box_screen = (anchor_screen[0] - 14, anchor_screen[1] - 14,
+                              anchor_screen[0] + 14, anchor_screen[1] + 14)
+            self._save_forensic(
+                "咬钩", self._cast_no,
+                box_screen=box_screen,
+                features=self._bite_features(current, anchor_screen, reason))
+        except Exception as e:
+            self.log("咬钩取证失败 %s", e)
+
+    def _prune_debug_frames(self):
+        """★ v55：只保留最近 keep_debug_casts 竿的 debug 帧图，防止无限膨胀。
+
+        按秒存图后实测一竿约 20~40 张，720x436 BMP ≈ 940KB/张
+        → 约 20~40MB/竿。一天 200 竿就是 4~8GB，必须自动回收。
+
+        规则：
+          · 文件名 cNNN_... 里的竿号 < (当前竿号 - keep) 的一律删；
+          · timeline.jsonl 同步过滤（保留未过期竿号的行）；
+          · 取证图（forensic/，首竿特征+锚点红框）不删 —— 那是唯一一次
+            标定的证据，删了以后无从追溯基准值从哪来；
+          · 日志文件不动，永远全留。
+        """
+        keep = int(getattr(self, "keep_debug_casts", 20) or 0)
+        if keep <= 0 or not (getattr(self, "debug_frames", False)
+                             or getattr(self, "save_regions", False)):
+            return
+        import os
+        import re
+        d = os.path.join(os.getcwd(), self._debug_dir)
+        if not os.path.isdir(d):
+            return
+        cutoff = self._cast_no - keep
+        if cutoff < 1:
+            return
+        removed = 0
+        freed = 0
+        for fn in os.listdir(d):
+            m = re.match(r"^c(\d+)_", fn)
+            if not m or not fn.lower().endswith(".bmp"):
+                continue
+            if int(m.group(1)) < cutoff:
+                try:
+                    p = os.path.join(d, fn)
+                    freed += os.path.getsize(p)
+                    os.remove(p)
+                    removed += 1
+                except Exception:
+                    pass
+        # timeline.jsonl 同步裁剪
+        tl = os.path.join(d, "timeline.jsonl")
+        if removed and os.path.isfile(tl):
+            try:
+                import json
+                rows = []
+                with open(tl, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            r = json.loads(line)
+                        except Exception:
+                            continue
+                        if int(r.get("cast", 0)) >= cutoff:
+                            rows.append(line)
+                with open(tl, "w", encoding="utf-8") as f:
+                    f.write("\n".join(rows) + ("\n" if rows else ""))
+            except Exception as e:
+                self.log("timeline 裁剪失败 %s", e)
+        if removed:
+            self.log("debug 帧清理: 删除 %d 张 / %.1fMB（保留最近 %d 竿，"
+                     "即 c%03d 起）", removed, freed / 1048576.0, keep, cutoff)
+
     def _dump_region(self, tag, bmp=None, extra="", force=False):
         """★ v45：存一帧「截屏区」原图到 debug/，文件名自带竿号+时间+区域信息。
 
         为什么要单独一个入口：
           · 用户要求「每杆都存区域截图」，一张图对应一帧日志；
           · 但每帧都存会拖慢检测 —— 实测 grab() + PIL 落盘 ~40ms，
-            判咬钩循环本来一帧 ~30ms，存图直接让帧率减半，真咬钩可能
-            只出现 1~2 帧，慢一半就是漏判。所以只在需要时存（见调用处）。
+            判咬钩循环本来一帧 ~42ms（真机实测中位 42ms，23.8fps），
+            存图直接让帧率腰斩，真咬钩可能只出现 3~7 帧，慢一半就是漏判。
         命名：c003_锚定_1280x801@640,354_t12.3s_局部607x236.bmp
+
+        ★ v55 按秒节流（用户要求「debug 图每秒存一次就行」）：
+          普通帧受 save_interval_sec 控制（默认 1.0 秒 1 张）；
+          以下情况无论如何都存，否则离线复盘会缺最关键的证据：
+            · force=True 的调用（锚点锁定、咬钩判定、重抛失败等事件帧）
+            · _dense_dump=True 的密集段（咬钩趋势出现后切 200ms 一张）
+          注意：标签本身不做强制（"咬钩"阶段每帧都调本函数，
+          若按标签强制就等于逐帧存图，与「每秒一张」冲突）。
         """
         if not (force or getattr(self, "debug_frames", False)
                 or getattr(self, "save_regions", False)):
             return None
+
+        # ---- v55 节流：决定这一帧到底存不存 ----
+        now = time.monotonic()
+        interval = float(getattr(self, "save_interval_sec", 1.0) or 0.0)
+        dense = bool(getattr(self, "_dense_dump", False))
+        crit = bool(force)
+        last_t = getattr(self, "_last_dump_t", 0.0)
+        last_cast = getattr(self, "_last_dump_cast", None)
+        gap = (now - last_t) if last_cast == self._cast_no else 1e9
+        # 密集段 200ms 一张；普通段 save_interval_sec（默认 1 秒）一张
+        need = 0.2 if dense else interval
+        if not crit and gap < need:
+            self._dump_skipped = getattr(self, "_dump_skipped", 0) + 1
+            return None
+        if not crit and interval <= 0:
+            # 间隔设 0 表示「只存事件帧」，普通帧一律不落盘
+            self._dump_skipped = getattr(self, "_dump_skipped", 0) + 1
+            return None
+
         import os
         from PIL import Image
         g = getattr(self.bobber_finder, "grabber", None)
@@ -596,6 +981,37 @@ class FishingBot:
                 self._cast_no, tag, w, h, l, t, el,
                 ("_" + extra) if extra else "", ts)
             Image.fromarray(bmp).save(os.path.join(d, name))
+            # 记录节流状态
+            self._last_dump_t = now
+            self._last_dump_cast = self._cast_no
+            # ★ v55：结构化清单。图片文件名里塞不下 yDiff / 检测坐标 / 阈值，
+            #   而离线复盘要的就是「这一帧程序到底算出了什么」。每存一张图
+            #   就追加一行到 debug/timeline.jsonl，字段与图一一对应，
+            #   重放脚本按它精确对齐，不再靠解析文件名猜。
+            try:
+                import json
+                rec = {
+                    "cast": int(self._cast_no),
+                    "tag": tag,
+                    "file": name,
+                    "t": round(float(now - (self._last_cast_t or now)), 3),
+                    "wall": ts,
+                    "elapsed": el.lstrip("_") or None,
+                    "w": int(w), "h": int(h), "offset": [int(l), int(t)],
+                    "detect": getattr(self, "_last_detect_xy", None),
+                    "anchor": getattr(self, "_calib_anchor_local", None),
+                    "anchor_y": getattr(self.bite_watcher, "per_cast_anchor_y", None),
+                    "y": getattr(self.bite_watcher, "_last_y", None),
+                    "y_diff": getattr(self.bite_watcher, "y_diff", None),
+                    "strike": getattr(self.bite_watcher, "strike_value", None),
+                    "dense": bool(getattr(self, "_dense_dump", False)),
+                    "extra": extra or None,
+                }
+                with open(os.path.join(d, "timeline.jsonl"), "a",
+                          encoding="utf-8") as _tf:
+                    _tf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except Exception as _je:
+                self.log("timeline 记录失败 %s", _je)
             self.log("区域帧[%s] debug/%s", tag, name)
             return name
         except Exception as e:
@@ -883,6 +1299,32 @@ class FishingBot:
                 old = getattr(self.bite_watcher, "strike_value", None)
                 self.bite_watcher.strike_value = int(got)
                 self.log("咬钩阈值已按实测标定: strike_value %s → %d", old, int(got))
+                # ★ v55 用户要求第①条：首竿「咬钩特征值」必须落盘取证。
+                #   这是整场唯一一次标定，一旦没留证据，之后所有咬钩判定的
+                #   基准值从哪来就无从追溯。区域图用标定参考帧（ref），
+                #   红框打在本竿锚点上，txt 记 strike 前后值和采样统计。
+                if getattr(self, "forensic", False):
+                    try:
+                        feat = {
+                            "标定类型": "首竿下沉幅度标定（静水采样）",
+                            "采样窗口": "%.0fs（含飞行时间）" % float(self.sink_calib_seconds),
+                            "采样帧数": len(getattr(calib, "points", [])),
+                            "标定前_strike": old if old is not None else "?",
+                            "标定后_strike": int(got),
+                            "静水抖动P90": round(float(getattr(calib, "p90", 0.0) or 0.0), 2),
+                            "最大净下沉": getattr(calib, "max_sink", "?"),
+                            "浮动估计": round(float(getattr(calib, "float_est", 0.0) or 0.0), 2),
+                            "说明": "此后每竿判咬钩都用这一个阈值，锚点按竿重定、阈值不重标",
+                        }
+                        anchor = getattr(self, "_calib_anchor_local", None)
+                        # _save_forensic(tag, cast_no, bmp_region, box_local, ...)
+                        # 标定锚点是「局部坐标」，只给 box_local，
+                        # 屏幕框由函数按截屏区原点反算，不猜。
+                        self._save_forensic("首竿标定", self._cast_no,
+                                            bmp_region=ref, box_local=anchor,
+                                            features=feat)
+                    except Exception as _fe:
+                        self.log("取证[首竿标定] 失败 %s", _fe)
             else:
                 self.log("咬钩标定没拿到有效数据，沿用原阈值 %s",
                          getattr(self.bite_watcher, "strike_value", "?"))
@@ -1366,7 +1808,7 @@ class FishingBot:
             except Exception as e:
                 self.log("诊断: 失败帧落盘失败 %s", e)
             try:
-                self._dump_region("重抛", extra="找锚点失败")
+                self._dump_region("重抛", extra="找锚点失败", force=True)
             except Exception as e:
                 self.log("重抛帧落盘失败 %s", e)
             # 确认图：这一帧里浮标到底在不在、在不在排除区外
@@ -1388,7 +1830,23 @@ class FishingBot:
         # ★ v45：锚点定下来立刻存一张区域图 —— 之后浮标一沉，画面就变了，
         #   这张是唯一能事后核对「锚点打在哪」的证据。
         self._dump_region("锚定", extra="锚点%d_%d" % (bobber_position[0],
-                                                      bobber_position[1]))
+                                                      bobber_position[1]), force=True)
+        # ★ v55：关键节点取证 —— 浮标区域图(红框) + 全屏图(红框) + 特征值
+        #   首竿的文件名带「首竿_」，一眼能找到「首竿拿到的浮标特征」。
+        try:
+            _loc = self._to_local(bobber_position)
+            _blk = getattr(self.bobber_finder, "_last_block", None)
+            _box_l = None
+            if _blk and len(_blk) >= 3:
+                _bw, _bh = int(_blk[1]), int(_blk[2])
+                _box_l = (_loc[0] - _bw // 2, _loc[1] - _bh // 2,
+                          _loc[0] + _bw // 2, _loc[1] + _bh // 2)
+            else:
+                _box_l = (_loc[0] - 12, _loc[1] - 12, _loc[0] + 12, _loc[1] + 12)
+            self._save_forensic("锚定", self._cast_no, box_local=_box_l,
+                                features=self._anchor_features(_loc, bobber_position))
+        except Exception as e:
+            self.log("锚定取证失败 %s", e)
         self._verify_and_watch(bobber_position)
 
     def _verify_and_watch(self, bobber_position):
@@ -1449,8 +1907,37 @@ class FishingBot:
             _t0 = time.monotonic()
             current = self.bobber_finder.find()
             _dt = time.monotonic() - _t0
+            # ★ v55：把本帧检测结果记到实例上，供 _dump_region 写进 timeline.jsonl。
+            #   之前没有任何地方保存这两个值，timeline 里 detect/y 会全是 null，
+            #   等于白记 —— 而「这一帧检测到哪儿、y 是多少」正是复盘的核心。
+            self._last_detect_xy = ([int(current[0]), int(current[1])]
+                                    if current is not None else None)
+            if current is not None:
+                self.bite_watcher._last_y = int(current[1])
             if current is None and _dt > 0.4:
                 self.log("单帧扫描耗时 %.2fs（浮标可能已消失）", _dt)
+
+            # ★ v55：判咬钩循环按秒存图（用户要求「debug 图每秒存一次就行」）。
+            #   之前这一段一帧图都不存，离线复盘时只能看到「yDiff=6 命中」这种
+            #   数字，没法核对那一帧浮标到底沉了多少像素 —— 而这正是最该验的部分。
+            #   节流逻辑在 _dump_region 里：普通帧 1 秒 1 张；一旦检测到下沉趋势
+            #   （下沉 ≥ 3px，距阈值 6px 只有一半）就切密集模式 200ms 1 张，
+            #   咬钩判定那帧由 critical_tags 强制存。
+            try:
+                if getattr(self, "debug_frames", False) or getattr(
+                        self, "save_regions", False):
+                    _yd = getattr(self.bite_watcher, "y_diff", 0) or 0
+                    _sink = -_yd
+                    self._dense_dump = _sink >= 3
+                    _lb = getattr(self.bobber_finder, "_bmp", None)
+                    self._dump_region(
+                        "咬钩前" if not self._dense_dump else "咬钩前密集",
+                        bmp=_lb,
+                        extra="y%d_沉%d_检%s" % (
+                            current[1] if current else -1, _sink,
+                            "%d_%d" % current if current else "无"))
+            except Exception as _de:
+                self.log("咬钩期存帧异常 %s", _de)
 
             # robust 模式：浮标消失本身是咬钩信号，必须传给 watcher
             if robust:
@@ -1475,7 +1962,9 @@ class FishingBot:
                     self._dump_region("咬钩", extra="锚点%d_%d_当前%s" % (
                         bobber_position[0], bobber_position[1],
                         "%d_%d" % (current[0], current[1])
-                        if current is not None else "消失"))
+                        if current is not None else "消失"), force=True)
+                    # ★ v55：咬钩节点取证 —— 咬钩区域图(红框) + 全屏 + 咬钩特征值
+                    self._forensic_bite(current, bobber_position, "y位移下沉")
                     self._loot(bobber_position)     # ← 传抛竿位置，不是 current
                     self._press_ten_min_key_if_due()
                     return
@@ -1494,6 +1983,8 @@ class FishingBot:
                         self.log("咬钩判定: 浮标面积渐进缩小至消失 → 判为咬钩")
                         self._dump_region("咬钩衰减", extra="锚点%d_%d" % (
                             bobber_position[0], bobber_position[1]))
+                        # ★ v55：衰减式咬钩同样取证
+                        self._forensic_bite(None, bobber_position, "面积渐进衰减")
                         self._loot(bobber_position)
                         self._press_ten_min_key_if_due()
                         return
@@ -1505,6 +1996,16 @@ class FishingBot:
                     return
 
                 if self.bite_watcher.is_bite(current):
+                    # ★ v55：legacy 分支也要取证（否则切 --bite-mode legacy 时
+                    #   关键节点数据全丢，离线无从复盘）
+                    self.log("咬钩判定(legacy): 下沉 yDiff=%s（%s）",
+                             getattr(self.bite_watcher, "y_diff", None),
+                             "浮标消失" if current is None else "位置下沉")
+                    self._dump_region("咬钩", extra="锚点%d_%d_当前%s" % (
+                        bobber_position[0], bobber_position[1],
+                        "%d_%d" % (current[0], current[1])
+                        if current is not None else "消失"), force=True)
+                    self._forensic_bite(current, bobber_position, "y位移下沉(legacy)")
                     self._loot(bobber_position)     # ← 传抛竿位置，不是 current
                     self._press_ten_min_key_if_due()
                     return

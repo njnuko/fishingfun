@@ -80,11 +80,20 @@ def main():
     # ★ v45：复盘日志（用户要求每竿锚点 / 每秒浮动值 / 区域截图都进日志）
     ap.add_argument("--save-regions", default="1", choices=["1", "0"],
                     help="每竿的「锚定 / 咬钩 / 重抛」区域截图存 debug/（默认 1 开）")
+    ap.add_argument("--forensic", default="1", choices=["1", "0"],
+                    help="★ 关键节点取证（默认 1 开）：每竿存 "
+                         "锚定/咬钩 的「区域图+红框」「全屏图+红框」「特征值.txt」。"
+                         "首竿文件名带 首竿_ 前缀")
     ap.add_argument("--frame-log", default="1", choices=["1", "0"],
                     help="判咬钩期间逐帧输出「当前y / 锚点y / 下沉px / 阈值」（默认 1 开，"
                          "日志会变长）")
     ap.add_argument("--trace-sec", type=float, default=1.0,
                     help="每竿跟踪期每 N 秒存一张区域图并记一行采样（默认 1.0 秒，0=关）")
+    ap.add_argument("--save-interval", type=float, default=1.0,
+                    help="判咬钩期 debug 图存档间隔秒数（默认 1.0 = 每秒一张）。"
+                         "咬钩趋势出现时自动切到 0.2 秒一张，事件帧始终强制存")
+    ap.add_argument("--keep-casts", type=int, default=20,
+                    help="debug 帧图只保留最近 N 竿（默认 20 竿约 600MB），0=不限。日志不受影响")
     ap.add_argument("--diff-bobber", default="1", choices=["1", "0"],
                     help="用 R-B 色差找浮标（默认 1 开）。不写死颜色，亮黄/暗橙都能找")
     ap.add_argument("--diff-threshold", type=int, default=20,
@@ -259,6 +268,16 @@ def main():
     bot.save_regions = (args.save_regions == "1") or bot.debug_frames
     bot.frame_log = (args.frame_log == "1") or bot.debug_frames
     bot.trace_seconds = float(args.trace_sec)
+    bot.save_interval_sec = float(args.save_interval)
+    bot.keep_debug_casts = int(args.keep_casts)
+    # ★ v55：关键节点取证默认开（--debug 1 也强制开）
+    bot.forensic = (args.forensic == "1") or bot.debug_frames
+    if bot.forensic:
+        log("关键节点取证: 开 → 每竿 debug/ 下三件套")
+        log("  · cNNN_[首竿_]锚定_区域_WxH@原点_t秒_时间.bmp  （浮标处红框）")
+        log("  · cNNN_[首竿_]锚定_全屏_WxH_t秒_时间.bmp        （整屏+红框，离线调试用）")
+        log("  · cNNN_[首竿_]锚定_特征_时间.txt                （浮标尺寸/面积/填充率/指纹）")
+        log("  · cNNN_咬钩_区域/全屏/特征                   （咬钩图 + strike_value/yDiff）")
     watcher.frame_log = bot.frame_log
     if bot.save_regions or bot.frame_log:
         log("复盘日志: 区域截图=%s 逐帧浮动值=%s 跟踪逐秒采样=%.1fs",

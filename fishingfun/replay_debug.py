@@ -95,14 +95,108 @@ class Cast:
         return "<Cast #%d %d帧 %s>" % (self.no, len(self.frames), self.region)
 
 
+def _scan_from_timeline(tl_path):
+    """★ v55：用 timeline.jsonl 建帧索引。
+
+    每行形如：
+      {"n":12,"t":17.8,"cast":1,"stage":"咬钩","xy":[713,406],"y":406,
+       "anchor_y":402,"yDiff":4,"strike":6,"file":"c001_咬钩_..."}
+
+    返回 (casts, origin, skipped)：
+      · casts   —— 按竿号聚合的 Cast 对象，frames 里带精确时刻 t
+      · origin  —— (w, h, ox, oy) 从文件名解析
+      · skipped —— 清单里有记录但图文件已被清理掉的条数（要在报告里喊出来，
+                   否则重放会「看起来通过」其实少了一半帧）
+    """
+    import json
+    rows = []
+    with open(tl_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    if not rows:
+        return [], None, 0
+
+    d = os.path.dirname(tl_path)
+    origin = None
+    casts = {}
+    skipped = 0
+    for r in rows:
+        fn = r.get("file") or ""
+        m = REGION_RE.match(fn)
+        if not m:
+            continue
+        no = int(r.get("cast") or m.group(1))
+        if origin is None:
+            origin = (int(m.group("w")), int(m.group("h")),
+                      int(m.group("ox")), int(m.group("oy")))
+        c = casts.get(no)
+        if c is None:
+            c = Cast(no)
+            c.region = (int(m.group("w")), int(m.group("h")),
+                        int(m.group("ox")), int(m.group("oy")))
+            casts[no] = c
+        path = os.path.join(d, fn)
+        if not os.path.isfile(path):
+            skipped += 1
+            continue
+        c.frames.append((float(r.get("t") or 0.0),
+                         r.get("stage") or "帧",
+                         str(r.get("xy") or ""),
+                         path))
+
+    out = []
+    for no in sorted(casts):
+        c = casts[no]
+        if not c.frames:
+            continue
+        c.frames.sort(key=lambda x: x[0])
+        # 本竿时长上界 = 下一竿首帧时刻；最后一竿用自身 span
+        out.append(c)
+    for i, c in enumerate(out[:-1]):
+        c.finish_t = out[i + 1].frames[0][0]
+    return out, origin, skipped
+
+
 def scan_debug_dir(root):
-    """扫描 debug 目录，返回 (sorted casts, full_frames, origin)。"""
+    """扫描 debug 目录，返回 (sorted casts, full_frames, origin, skipped)。
+
+    ★ v55：优先读 timeline.jsonl。它是程序落盘时同步写的结构化清单
+    （帧号/时刻/检测坐标/yDiff/阈值/文件名），能精确对齐「日志某行 ↔ 某张图」。
+    没有 timeline 的旧 debug 包才退回解析文件名。
+    """
     cands = [root]
     # 兼容用户直接解压 zip 到子目录的情况
     for name in os.listdir(root) if os.path.isdir(root) else []:
         p = os.path.join(root, name, "debug")
         if os.path.isdir(p):
             cands.append(p)
+
+    def pick(name):
+        for d in cands:
+            f = os.path.join(d, name)
+            if os.path.isfile(f):
+                return f
+        return None
+
+    tl = pick("timeline.jsonl")
+    if tl:
+        casts, origin, skipped_n = _scan_from_timeline(tl)
+        if casts:
+            # 整屏帧仍然按文件名收集
+            fulls = []
+            d = os.path.dirname(tl)
+            for fn in sorted(os.listdir(d)):
+                mf = FULL_RE.match(fn)
+                if mf:
+                    fulls.append((int(mf.group(1)), os.path.join(d, fn)))
+            return casts, fulls, origin, skipped_n
+
     files = []
     for d in cands:
         if os.path.isdir(d):
@@ -162,6 +256,7 @@ class TimeLineGrabber:
         self.cursor_park = (0, 0)     # 由 FakeWowProcess 同步
         self._cache = {}
         self.grab_count = 0
+        self.unique_paths = set()     # ★ v55：真实读到的不同帧（用于揭穿「同一帧重复」）
         # idle 帧：用于「还没到第一帧时间点」时的兜底画面。
         # 取该竿最早的一帧（通常就是 t=0.1s 的跟踪帧，浮标还在空中/刚落水）。
         self.idle_path = cast.frames[0][3] if cast.frames else None
@@ -181,6 +276,8 @@ class TimeLineGrabber:
         t = self.clock
         self.clock += self.step
         path = self._frame_at(t)
+        if path is not None:
+            self.unique_paths.add(path)
         if path is None:
             # 没有可用帧：返回纯黑，模拟「画面全暗」
             w, h = (self.cast.region[0], self.cast.region[1]) \
@@ -373,6 +470,7 @@ def run_one_cast(bot, cast, args, log):
         except Exception as _pe:
             log("⚠️ 鼠标停靠失败: %s", _pe)
         bot._cast_no += 1
+        bot._is_first_cast = (bot._cast_no == 1)   # ★ v55：首竿取证文件名带前缀
         bot.fishing_event_handler({"Action": "Cast"})
         bot._grab_calib_pre()
         bot._last_cast_t = time.monotonic()
@@ -401,6 +499,8 @@ def run_one_cast(bot, cast, args, log):
 
     res["clicks"] = len(wow.clicks) - before_clicks
     res["frames_read"] = grabber.grab_count
+    res["unique_frames"] = len(grabber.unique_paths)   # ★ v55：真实不同帧数
+    res["cast_frames"] = len(cast.frames)
     res["park_ok"] = (
         bool(wow._park_before_cast)
         and all(wow._park_before_cast[-max(1, wow.casts - before_casts):]))
@@ -419,6 +519,14 @@ def main():
                     help="不用虚拟时钟（真 sleep，很慢，仅供对照）")
     ap.add_argument("--drop-first-park", type=int, default=0, metavar="N",
                     help="前 N 竿模拟 SendInput 被吞一次，验证重试兜底")
+    ap.add_argument("--forensic", action="store_true",
+                    help="重放时也走 v55 关键节点取证（区域图/全屏图/特征txt 落盘）")
+    ap.add_argument("--bite-mode", default="robust", choices=["robust", "legacy"],
+                    help="咬钩判定模式，必须与 run.py 默认一致（默认 robust）")
+    ap.add_argument("--strike", type=int, default=4,
+                    help="咬钩阈值 px，必须与 run.py 默认一致（默认 4）；传 0 会恒判咬钩")
+    ap.add_argument("--outdir", default="replay_out",
+                    help="重放取证输出目录（默认 ./replay_out）")
     args = ap.parse_args()
 
     lines = []
@@ -441,6 +549,9 @@ def main():
     print("=" * 78)
     print("FishingFun 离线时序重放")
     print("  区域帧竿数: %d    整屏帧: %d    跳过: %d" % (len(casts), len(fulls), skipped))
+    if skipped:
+        print("  ⚠️ timeline 里有 %d 条记录对应的图已被清理（--keep-casts 回收），"
+              "这些帧无法重放" % skipped)
     print("  截屏区原点: %s" % (origin,))
     for c in casts:
         kinds = {}
@@ -470,7 +581,13 @@ def main():
     finder.no_bobber_limit = 85
     finder.strict_yellow = True
 
-    watcher = PositionBiteWatcher(0.0, mode="yellow", confirm_frames=2,
+    # ★ v55 修正：mode 是「咬钩判定模式」robust/legacy，不是颜色模式！
+    #   这里原写成 mode="yellow" → getattr(w,"mode")=="robust" 为 False，
+    #   重放全程走 legacy 原版分支，等于验证的不是真机跑的那条路。
+    #   run.py 默认 --bite-mode robust，所以这里必须一致。
+    # ★ v55 修正：strike 传 0 会让 `-y_diff >= 0` 恒成立、第一帧就判咬钩，
+    #   重放出来的「4/4 咬钩」全是假的。这里与 run.py 默认值一致传 4。
+    watcher = PositionBiteWatcher(args.strike, mode=args.bite_mode, confirm_frames=2,
                                   vanish_frames=3)
     watcher.auto_strike = True
     watcher.per_cast_anchor_mode = True
@@ -480,6 +597,30 @@ def main():
     bot = FishingBot(finder, watcher, cast_key=0x34, wow_process=wow,
                      log=log, grabber=None)
     bot.calib_sink = False          # 重放不做 17 秒标定（帧不够）
+    bot.forensic = args.forensic    # ★ v55：重放也走取证路径，验证三件套能落地
+    # 重放没有真实桌面：给全屏截图打桩，返回一块「区域图贴在屏幕中央」的合成
+    # 1440x900 画布，这样红框位置是否对得上全屏坐标可以直接肉眼验证。
+    if args.forensic:
+        os.makedirs(args.outdir, exist_ok=True)
+        bot._debug_dir = args.outdir
+
+        def _fake_fullscreen():
+            import numpy as _np
+            h, w = 900, 1440
+            canvas = _np.zeros((h, w, 3), _np.uint8)
+            g = bot.bobber_finder.grabber
+            try:
+                reg = g.grab()
+                ox, oy = (g.cast.region[2], g.cast.region[3])
+                rh, rw = reg.shape[0], reg.shape[1]
+                ox = min(ox, w - rw)
+                oy = min(oy, h - rh)
+                canvas[oy:oy + rh, ox:ox + rw] = reg
+            except Exception:
+                pass
+            return canvas, (0, 0)
+
+        bot._grab_fullscreen = _fake_fullscreen
     wow.park_drop_first = args.drop_first_park > 0
     bot.save_regions = False
     bot.frame_log = False
@@ -513,15 +654,23 @@ def main():
     print("重放结果")
     print("=" * 78)
     print("%-6s %-8s %-8s %-8s %-8s %s" %
-          ("竿", "读到帧", "锚点", "咬钩", "点击", "备注"))
+          ("竿", "读到/独立", "锚点", "咬钩", "点击", "备注"))
     bad = 0
+    thin = 0
     for r in results:
         note = r["err"] or ""
+        # ★ v55：帧密度告警。debug 包只有节点帧时，同一帧会被反复返回，
+        #   「读到帧=125」但 unique_frames=3，此时「咬钩」结论没有意义。
+        uf = r.get("unique_frames", 0)
+        cf = r.get("cast_frames", 0)
+        if cf <= 6 or uf <= 6:
+            note = (note + " ⚠️帧过稀(仅节点帧,非连续时序)").strip()
+            thin += 1
         if not r["anchor"]:
             note = (note + " 从未锁定浮标").strip()
             bad += 1
-        print("%-6d %-8d %-8s %-8s %-8d %s" % (
-            r["cast"], r["frames_read"],
+        print("%-6d %-8s %-8s %-8s %-8d %s" % (
+            r["cast"], "%d/%d" % (r["frames_read"], uf),
             "✅" if r["anchor"] else "❌",
             "✅" if r["bite"] else "—",
             r["clicks"], note))

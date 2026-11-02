@@ -215,16 +215,23 @@ class PositionBiteWatcher:
             self.y_diff = self.per_cast_anchor_y - y
             # ★ v45：逐帧明细。用户要「每帧/每秒的浮动值」都能在日志里查到，
             #   否则出现误判时无从复现。只在 frame_log 开启时输出。
+            _eff = max(1, int(self.strike_value))
             if getattr(self, "frame_log", False):
                 self.log("浮动值: t帧 y=%d 锚点y=%d yDiff=%d 下沉=%dpx 阈值=%dpx 命中=%s",
                          y, self.per_cast_anchor_y, self.y_diff, -self.y_diff,
-                         int(self.strike_value),
-                         "是" if -self.y_diff >= int(self.strike_value) else "否")
-            if -self.y_diff >= int(self.strike_value):
+                         _eff,
+                         "是" if -self.y_diff >= _eff else "否")
+            # ★ v55：阈值兜底。strike_value=0 时 `-y_diff >= 0` 恒成立，
+            #   第一帧就会「判咬钩」（重放脚本误传 0 时实测如此）。
+            #   真机标定返回值有下限（p90+2 且 max 6），但配置错 / 标定失败
+            #   兜底 / 外部脚本构造都可能给 0，这里统一按 1px 起算，
+            #   宁可钝一点，也绝不空钩乱抬。
+            _eff = max(1, int(self.strike_value))
+            if -self.y_diff >= _eff:
                 self._streak += 1
                 self.log("锚点判定: 锚点 y=%d 当前 y=%d 下沉 %dpx ≥ 阈值 %d（连续 %d）",
                          self.per_cast_anchor_y, y, -self.y_diff,
-                         int(self.strike_value), self._streak)
+                         _eff, self._streak)
                 if self._streak >= max(1, int(getattr(self, "confirm_frames", 1))):
                     return self._fire()
             else:
