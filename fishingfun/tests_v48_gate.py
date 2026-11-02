@@ -38,6 +38,8 @@ class FakeBot:
 
     def __init__(self):
         self.msgs = []
+        self.bobber_finder = None      # ★ v49：_bright_px_floor 会读指纹
+                                       # 留空=走固定 90 兜底，保持 v48 口径
 
     def log(self, fmt, *a):
         self.msgs.append(fmt % a if a else fmt)
@@ -46,6 +48,10 @@ class FakeBot:
 from fishingfun.fishbot import FishingBot  # noqa: E402
 
 FakeBot._anchor_has_bobber = FishingBot._anchor_has_bobber
+# ★ v49：_anchor_has_bobber 的内部门槛改成调用这两个方法
+FakeBot.BRIGHT_PX_FP_RATIO = FishingBot.BRIGHT_PX_FP_RATIO
+FakeBot._bright_px_target = FishingBot._bright_px_target
+FakeBot._bright_px_floor = FishingBot._bright_px_floor
 
 img = load_rgb("/opt/data/cache/images/img_2d27b1fa00a9.jpg")
 print("帧尺寸", img.shape)

@@ -8,6 +8,8 @@
 唯一加速改动：循环用 numpy 向量化，判定顺序与语义完全一致。
 """
 
+import time
+
 import numpy as np
 
 from .pixelclassifier import PixelClassifier
@@ -130,10 +132,50 @@ class SearchBobberFinder:
                 fp["w"], fp["h"], fp["area"], fp.get("rgb"), fp["frames"])
         return fp
 
+    def area_decayed(self, window=1.2, drop_ratio=0.72):
+        """★ v49：判定「丢标前浮标是否在逐渐缩小」= 鱼在往下拉。
+
+        真机证据（720x529 环境，08:56:32）：
+            锚定   area=457  （本竿锚点打印的亮团面积）
+            命中   area=313  （连续 4 帧，最后一条命中）
+            之后   连续 3 帧未命中 → 停机（错误）
+        313/457 = 0.69，且 458→313 的缩小发生在 100ms 量级 —— 这就是浮标
+        被鱼拉进水面的样子。判据：
+
+          取最近 window 秒内的面积样本，若
+            ① 样本 ≥3 个；
+            ② 最后样本 / 最早样本 ≤ drop_ratio（默认 0.72，即缩了 ≥28%）；
+            ③ 整体单调不回升（允许 5% 抖动）；
+          则认为是渐进缩小 → 咬钩。
+
+        与「一步归零」的区别：一步归零时面积没有中间样本，条件②③不成立。
+        """
+        hist = [h for h in getattr(self, "_area_hist", [])
+                if time.time() - h[0] <= window]
+        if len(hist) < 3:
+            return False
+        areas = [a for _, a in hist]
+        first, last = areas[0], areas[-1]
+        if first <= 0:
+            return False
+        if last / float(first) > drop_ratio:
+            return False
+        # 允许 5% 抖动，但整体不能回升
+        for i in range(1, len(areas)):
+            if areas[i] > areas[i - 1] * 1.05:
+                return False
+        self.log("面积衰减序列 %s → %d/%d=%.2f，判为浮标被拉入水面（咬钩）",
+                 areas, last, first, last / float(first))
+        return True
+
     def reset(self):
-        # 逐行对应 SearchBobberFinder.cs:29-32
         self.previous_location = None
         self._area_hist = []      # 非原版：本竿面积历史，用于尺寸跳变判定
+        # ★ v49：重抛后必须把「连续找不到浮标」的计数清零。
+        #   原来 reset() 没清，上一竿凑满 3 帧触发停机后计数器仍是 3，
+        #   新一竿第一帧再 miss 一次就立刻又到 3（no_bobber_limit=3），
+        #   等于重抛之后必然再次秒停 —— 「重抛继续」形同虚设。
+        self.no_bobber_frames = 0
         # v37：每竿重置色差锚点，避免上一竿的浮标位置影响本竿
         self._diff_anchor = None
         self._diff_hits = 0
@@ -518,6 +560,18 @@ class SearchBobberFinder:
                          cx, cy, bw, bh, self._diff_hits, cf)
                 return None
         self._last_block = (size, bw, bh)      # ★ v43：供首竿建「浮标指纹」
+        # ★ v49：记录命中面积 + 帧序号，用于区分「浮标瞬间消失」和
+        #   「浮标逐渐缩小」。真机日志证据：
+        #     08:56:32,922 area=313（连续 4 帧）
+        #     08:56:33,039 未命中 1/3
+        #   两条间隔仅 117ms，area 从 458(锚定) 掉到 313 再彻底消失 —— 这是
+        #   鱼把浮标往水里拉的典型曲线（浮标露出水面的部分越来越小）。
+        #   反之若是「浮标被拉出截屏区/角色挡视野」，面积会先持平再整体消失，
+        #   或干脆从满面积一步归零。两者处理不同：缩小的→立刻提竿；
+        #   一步归零的→重抛。
+        self._area_hist.append((time.time(), int(size)))
+        if len(self._area_hist) > 12:
+            self._area_hist = self._area_hist[-12:]
         self.log("色差浮标命中: (%d,%d) %dx%d area=%d (连续 %d 帧)",
                  cx, cy, bw, bh, size, getattr(self, "_diff_hits", 1))
         return (int(cx), int(cy))

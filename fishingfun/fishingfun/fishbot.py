@@ -61,8 +61,51 @@ class FishingBot:
         self.save_regions = False   # True = 每竿锚定/咬钩/重抛都存区域图
         self.frame_log = False      # True = 判咬钩循环每帧输出浮动值一行
         self.trace_seconds = 1.0    # 每竿前 N 秒逐秒存区域图（0=关）
+        # ★ v49：可恢复停机（只结束本轮，不退出主循环）+ 第 N 竿标定保护
+        self._soft_stop = False
+        self.soft_stop_pause = 0.35
+        # ★ v49：首竿标定期间（17 秒）浮标本来就可能被咬走/离场，
+        #   这段时间的「找不到浮标」一律不判停机，只记日志。
+        self._calibrating = False
 
     # ---- 非原版：首竿标定截屏边界 ----
+    def _set_calibrating(self, on):
+        """★ v49：标定期间关掉「连续 N 帧找不到浮标 → 停机」这条链。
+
+        标定要连续采样 17 秒，期间鱼咬钩、浮标沉底、玩家转身都会让浮标
+        短时消失 —— 这些都不是故障，是正常钓鱼过程。原来这段时间里
+        finder 的 no_bobber_frames 照样累加，凑满 3 帧就停整个程序。
+
+        做法：进标定先把 suppress_abort + no_anchor_lock 打开（飞行期用的
+        同一套抑制开关），出来再恢复成原来的值，不影响其它阶段。
+        """
+        self._calibrating = bool(on)
+        f = self.bobber_finder
+        if f is None:
+            return
+        if on:
+            self._calib_saved_flags = (
+                getattr(f, "suppress_abort", False),
+                getattr(f, "no_anchor_lock", False),
+            )
+            f.suppress_abort = True
+            f.no_anchor_lock = True
+            try:
+                if hasattr(f, "no_bobber_frames"):
+                    f.no_bobber_frames = 0
+            except Exception:
+                pass
+        else:
+            sa, nal = getattr(self, "_calib_saved_flags", (False, False))
+            f.suppress_abort = sa
+            f.no_anchor_lock = nal
+            try:
+                if hasattr(f, "no_bobber_frames"):
+                    f.no_bobber_frames = 0
+            except Exception:
+                pass
+
+
     def _arm_screen_area(self):
         """第一次抛竿后量一次截屏边界，之后永久沿用（用户设计）。
 
@@ -152,12 +195,35 @@ class FishingBot:
 
                 # v21：第一竿抛竿后采 17 秒，实测本钓点浮标下沉幅度，
                 # 反推 strike_value。只做一次，之后所有竿沿用。
-                self._maybe_calibrate_sink()
+                # ★ v49：标定期间禁用 abort —— 这 17 秒里浮标被咬走/离场是
+                #   常态（真机日志 08:56:33 就是标定刚结束 3 帧内丢标），
+                #   之前会直接判「目标消失」并停机，等于把一次正常咬钩当成故障。
+                self._set_calibrating(True)
+                try:
+                    self._maybe_calibrate_sink()
+                finally:
+                    self._set_calibrating(False)
 
                 self._wait_for_bite()
             except Exception as e:
                 self.log("ERR %s", e)
                 time.sleep(2.0)
+
+            # ★ v49：可恢复停机检查。
+            #   run.py 的 abort_cb 在「本竿已锁定过浮标、之后找不到」时
+            #   判定为咬钩/目标消失，要求「重抛继续」。
+            #   v48 及以前它直接 is_enabled=False，而主循环 while 只看
+            #   is_enabled，于是打完「重抛继续」下一行就是 Bot has Stopped ——
+            #   真机日志 08:56:33 就是这么停的（浮标 area 458→313 渐进缩小，
+            #   明显是鱼把浮标拉进水了，本该立刻重抛）。
+            #   现在：可恢复停机只清 _soft_stop，主循环继续；
+            #   永久停机（用户要求退出 / 本竿从未锁定浮标）才真正结束。
+            if getattr(self, "_soft_stop", False):
+                self._soft_stop = False
+                self.is_enabled = True
+                pause = getattr(self, "soft_stop_pause", 0.35)
+                self.log("→ 可恢复停机：本轮结束，%.2f 秒后重抛（不退出）", pause)
+                time.sleep(pause)
 
         self.log("Bot has Stopped.")
 
@@ -274,6 +340,16 @@ class FishingBot:
     MIN_WARM_PX_AT_ANCHOR = 20        # 兼容旧调用，仅用于「暖色加分」日志
     ANCHOR_WIN_R = 30                 # ★ 邻域半径 20→30（浮标本体 31x23，40x40 太小）
     MIN_BRIGHT_PX_AT_ANCHOR = 90      # dev>30 的像素数下限（浮标 720，水面最多 56）
+    # ★ v49：亮团像素门槛改为「随浮标指纹面积自适应」。
+    #   固定 90 px 是在 1280x801 环境定的（浮标亮团 720 px，水面最多 56），
+    #   换到 720x529 后浮标只有 457 px —— 固定值仍能过，但一旦用户再降分辨率
+    #   或浮标更远（实测新环境已出现 313 px 的帧），90 就会随机误拒，
+    #   表现为「同样的水面，有时认浮标有时不认」。
+    #   新口径：门槛 = clamp(指纹亮团面积 × 0.35, MIN_BRIGHT_PX_AT_ANCHOR, 指纹面积)
+    #   · 有指纹时按比例缩放，分辨率变了自动跟随；
+    #   · 无指纹（首竿之前）退回固定 90，行为与 v48 一致；
+    #   · 下限仍为 90，防止指纹本身偏小时门槛低到把水面当浮标。
+    BRIGHT_PX_FP_RATIO = 0.35
     MIN_BRIGHT_PEAK_AT_ANCHOR = 70    # dev 峰值下限（浮标 126，水面最高 50）
     MIN_BRIGHT_AREA_RATIO = 0.03      # dev>30 像素占邻域面积比例下限
 
@@ -424,16 +500,49 @@ class FishingBot:
         bb = bmp[y0:y1, x0:x1, 2].astype(_np.int16)
         warm = int((((rr - bb) > 20) & (rr > 80)).sum())
 
-        ok = (n_bright >= self.MIN_BRIGHT_PX_AT_ANCHOR
+        ok = (n_bright >= self._bright_px_floor()
               and peak >= self.MIN_BRIGHT_PEAK_AT_ANCHOR
               and ratio >= self.MIN_BRIGHT_AREA_RATIO
               and off <= 0.8 * r)
         if log:
             self.log("锚点校验: 局部 (%d,%d) 高对比亮团 %d px(占比%.0f%%) 峰值%.0f "
-                     "质心偏移%.0fpx（暖色%d px 仅参考）→ %s",
+                     "质心偏移%.0fpx（暖色%d px 仅参考）→ %s（门槛 %d px%s）",
                      lx, ly, n_bright, ratio * 100.0, peak, off, warm,
-                     "通过" if ok else "拒绝（该处不是浮标亮团）")
+                     "通过" if ok else "拒绝（该处不是浮标亮团）",
+                     self._bright_px_floor(),
+                     "" if self._bright_px_target() is None
+                     else "，指纹面积 %d" % self._bright_px_target())
         return ok
+
+    def _bright_px_target(self):
+        """★ v49：从浮标指纹里取「亮团面积」基准，没有指纹返回 None。
+
+        指纹在 finder 上（learn_fingerprint 写入），字段 area 是浮标候选
+        的整体像素数。它和 _anchor_has_bobber 里 dev>30 的亮团数不完全同量纲
+        （后者是「显著高于局部背景」的部分），实测两者同环境比值约 0.6~0.7，
+        所以用 0.35 的系数留足余量，只做「随分辨率缩放」的用途，不做精判。
+        """
+        f = self.bobber_finder
+        if f is None:
+            return None
+        fp = getattr(f, "bobber_fingerprint", None)
+        if not fp:
+            return None
+        try:
+            a = int(fp.get("area") or 0)
+        except Exception:
+            return None
+        return a if a > 0 else None
+
+    def _bright_px_floor(self):
+        """★ v49：本竿亮团像素门槛（见 BRIGHT_PX_FP_RATIO 说明）。"""
+        target = self._bright_px_target()
+        if target is None:
+            return self.MIN_BRIGHT_PX_AT_ANCHOR
+        need = int(target * self.BRIGHT_PX_FP_RATIO)
+        need = max(need, self.MIN_BRIGHT_PX_AT_ANCHOR)
+        # 不超过指纹面积本身 —— 否则一旦系数定错就永远过不了
+        return min(need, target)
 
     def _dump_region(self, tag, bmp=None, extra="", force=False):
         """★ v45：存一帧「截屏区」原图到 debug/，文件名自带竿号+时间+区域信息。
@@ -1333,6 +1442,24 @@ class FishingBot:
                     self._loot(bobber_position)     # ← 传抛竿位置，不是 current
                     self._press_ten_min_key_if_due()
                     return
+                # ★ v49：浮标丢了，但本次是「面积渐进缩小」丢的 → 这就是咬钩。
+                #   v48 以前只看 y 位移，浮标面积从 457 缩到 313 再消失这种
+                #   曲线被当成「目标消失 → 重抛」，白白放跑一条鱼。
+                #   注意只在本竿锚点已锁定、且当前帧确实没找到时判，
+                #   避免和上面 y 位移判定重复。
+                if current is None and getattr(self, "_anchor_locked_this_cast", False):
+                    try:
+                        decayed = self.bobber_finder.area_decayed()
+                    except Exception as e:
+                        self.log("面积衰减判定异常 %s", e)
+                        decayed = False
+                    if decayed:
+                        self.log("咬钩判定: 浮标面积渐进缩小至消失 → 判为咬钩")
+                        self._dump_region("咬钩衰减", extra="锚点%d_%d" % (
+                            bobber_position[0], bobber_position[1]))
+                        self._loot(bobber_position)
+                        self._press_ten_min_key_if_due()
+                        return
                 if current is not None and current[0] == 0:
                     return
             else:

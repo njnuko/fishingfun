@@ -187,17 +187,28 @@ def main():
     #       绝不能打印「钓点太暗」误导用户（实测 20:42 日志：前面 64 帧
     #       全部稳定命中 (773,280)，标定结束后 3 帧丢失就报「钓点太暗」）。
     def _on_no_bobber(n):
+        if getattr(bot, "_calibrating", False):
+            log("标定期间连续 %d 帧找不到浮标（浮标被咬走/离场属正常），不判停机", n)
+            return
         if getattr(bot, "_anchor_locked_this_cast", False):
             log("=" * 60)
             log("⚠️  连续 %d 帧找不到浮标 —— 本竿已锁定过浮标，判为目标消失/咬钩", n)
             log("⚠️  不提示换钓点，重抛继续。")
             log("=" * 60)
-        else:
-            log("=" * 60)
-            log("⚠️  连续 %d 帧找不到浮标 —— 本竿从未锁定浮标", n)
-            log("⚠️  浮标不在视野内或与水面颜色重合，继续抛只会瞎钓。")
-            log("⚠️  请确认浮标在截屏区内、能看清，再重新启动。")
-            log("=" * 60)
+            # ★ v49：这里原来直接 is_enabled=False，于是「重抛继续」之后
+            #   下一行必定是 Bot has Stopped —— 真机日志 08:56:33 的停机
+            #   就是这么来的。现在只标记「本轮结束，可恢复」，
+            #   由 FishingBot.run() 的循环末尾清标志并继续下一竿。
+            bot._soft_stop = True
+            bot.is_enabled = False
+            return
+        log("=" * 60)
+        log("⚠️  连续 %d 帧找不到浮标 —— 本竿从未锁定浮标", n)
+        log("⚠️  浮标不在视野内或与水面颜色重合，继续抛只会瞎钓。")
+        log("⚠️  请确认浮标在截屏区内、能看清，再重新启动。")
+        log("=" * 60)
+        # 永久停机：从没锁定过，说明根本没看到浮标，重抛也没用。
+        bot._soft_stop = False
         bot.is_enabled = False
 
     finder.abort_cb = _on_no_bobber
