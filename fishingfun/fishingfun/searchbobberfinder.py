@@ -433,17 +433,61 @@ class SearchBobberFinder:
                 bright_mask = None
         if bright_mask is not None and bright_mask.any():
             if warm_mask is not None and warm_mask.any():
-                mask = warm_mask | bright_mask
-                self._log_once("v48 检测判据: 暖色∪亮团 合并生效")
+                # ★ v53 核心修复：从「并集」改成「分级」。
+                #   旧逻辑用 warm | bright 合并成一张图再连通域分析，后果真机实测
+                #   （2026-11-01 21:24，1280x801@640,354 的 17 帧）：
+                #     暖色通道单独看：真浮标 (594,227)-(619,245) 26x19 area≈360
+                #                    17/17 帧命中，质心只在 (606,236)±1px 内漂
+                #     亮团通道并进来后：鱼线（y=25..220 每行 1~4px）把浮标连成
+                #                    一块 65x221 area=924 的「丝状块」，质心被拉到
+                #                    (626,135)，比真浮标高 101px
+                #   并集等于用一条噪音通道去污染一条干净通道，是错的方向。
+                #   现状：先只在暖色块里找；暖色块全被否决（如冷色浮标场景）时，
+                #   才退到亮团块。这保留了 v48「冷白浮标也能抓」的能力，
+                #   又不会让鱼线/水面反光顶替真浮标。
+                sources = [(warm_mask, "暖色"), (bright_mask, "亮团")]
+                self._log_once("v53 检测判据: 暖色优先，亮团兜底（不再做并集）")
             else:
-                mask = bright_mask
-                self._log_once("v48 检测判据: 暖色无命中，改用亮团判据")
+                sources = [(bright_mask, "亮团")]
+                self._log_once("v53 检测判据: 暖色无命中，改用亮团判据")
+            mask = warm_mask if (warm_mask is not None and warm_mask.any()) else bright_mask
         if not mask.any():
             return None
         # ⚠️ 曾经加过 morph_close(r=4) 想修「浮标被鱼线切碎」，实测反而更糟：
         # 浮标右侧 30px 处有一团水面反光，颜色与浮标本体几乎一致，闭运算把
         # 两者连成一块，中心被拖偏 45px。不做闭运算时最大块就是浮标本体。
         blocks = bc.label_blocks(mask)
+        if not blocks:
+            return None
+        # ★ v53 核心修复：剔除「丝状连通块」（鱼线）。
+        #   真机证据（2026-11-01 21:24 那批 1280x801@640,354 的 17 帧）：
+        #     暖色块 = 浮标本体 (594,227)-(619,245) 26x19 area=368 ✅
+        #     亮团块 =       (594,25)-(658,245)  65x221 area=924 ❌
+        #   后者是「鱼线 + 浮标」被 8 连通连成的一整块：
+        #     y=25..220 每行只有 1~4 个像素（鱼线），y=230..245 每行 22 px（浮标）
+        #     填充率 924/(65*221) = 0.06，而浮标本体填充率约 0.7。
+        #   后果：质心被拉到 (626,135)，比真浮标 (606,236) 高 101px，
+        #   于是 find() 每帧都返回 y=136 附近的「假浮标」，后面的
+        #   锚点校验/三帧确认全在一个根本没有浮标的位置上反复失败。
+        #   判据：填充率 < 0.25 且 高度 ≥ 宽度的 2.5 倍 = 细丝/鱼线/UI 竖线。
+        #   浮标是立体小物体，任何光线下都填得比较满，不会长成这样。
+        _bd = getattr(self, "min_block_fill_ratio", 0.25)
+        _bl = getattr(self, "max_slender_ratio", 2.5)
+        kept = []
+        n_slender = 0
+        for _b in blocks:
+            _s, _x0, _y0, _x1, _y1 = _b[0], _b[1], _b[2], _b[3], _b[4]
+            _bw = _x1 - _x0 + 1
+            _bh = _y1 - _y0 + 1
+            _fill = _s / float(_bw * _bh) if _bw > 0 and _bh > 0 else 1.0
+            if _fill < _bd and _bh >= _bw * _bl:
+                n_slender += 1
+                continue
+            kept.append(_b)
+        if n_slender:
+            self._log_once("v53 剔除丝状块(鱼线): %d 个，填充率<%.2f 且 高/宽≥%.1f"
+                           % (n_slender, _bd, _bl))
+        blocks = kept
         if not blocks:
             return None
         sx = int(w * getattr(self, "exclude_side_ratio", 1.0 / 7.0))
@@ -476,7 +520,11 @@ class SearchBobberFinder:
         n_ok = 0
         n_fp_rej = 0
         self._last_fp_rejected = None      # ★ v50：每帧重置否决记录
-        for size, x0, y0, x1, y1, cx, cy in blocks:
+        # ★ v53：候选分级。暖色块（含真浮标）全部被否决后，才用亮团块再找一遍。
+        #   单帧只做一级，日志里能看出用的是哪一级。
+        _cand = blocks
+        _used_src = "暖色" if (warm_mask is not None and warm_mask.any()) else "亮团"
+        for size, x0, y0, x1, y1, cx, cy in _cand:
             if size < min_area:
                 continue
             if cx < sx or cx > w - sx or cy > by:

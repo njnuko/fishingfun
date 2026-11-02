@@ -948,10 +948,24 @@ class FishingBot:
                 if pos is not None:
                     hits += 1
                     last = pos
-                    positions.append(pos)   # ★ v42
+                    # ★ v53 核心修复：find() 返回的是【屏幕坐标】，而下面
+                    #   聚类/稳定位/previous_location 全都要【局部坐标】。
+                    #   真机日志（2026-11-02 10:37:43 第 1 竿）铁证：
+                    #     抛竿后跟踪 2.0s: 37 帧, 命中 7 帧, 末位置 (917, 506)
+                    #     追踪稳定位(局部): (910, 511)      ← 屏幕坐标冒充局部
+                    #     找锚点: 用本竿跟踪稳定位 局部 (910, 511) 作为搜索窗口中心
+                    #   而截屏区是 720x436@360,210，真浮标局部 (557,296)。
+                    #   910-360=550 / 511-210=301 → 就是浮标；不改的话
+                    #   previous_location 被写成屏幕值，搜索窗口直接跑到图外
+                    #   353px，后面每帧 find() 都在错误窗口里找，
+                    #   日志表现为「三帧确认: 候选 (917,506) 暖色闸门不过」反复刷。
+                    _pl = self._to_local(pos) if pos is not None else None
+                    positions.append(_pl if _pl is not None else pos)   # ★ v53
                     _lb = getattr(self.bobber_finder, "_last_block", None)
                     if _lb is not None:
-                        _blocks.append((pos, _lb))   # ★ v43：带位置存块信息
+                        # ★ v53：_blocks 与 positions 同坐标系（局部），
+                        #   否则下面按 stable(局部) 筛指纹样本会 100% 不匹配。
+                        _blocks.append((_pl if _pl is not None else pos, _lb))
                 # ★ v45：跟踪期逐秒留痕。用户要「后面每一杆的锚点 + 每秒值」
                 #   都能查，而 _watch 这 2 秒正是浮标落水后第一步定锚的窗口。
                 _tr = getattr(self, "trace_seconds", 0) or 0
@@ -992,7 +1006,12 @@ class FishingBot:
                 last_bmp = getattr(self.bobber_finder, "_bmp", None)
                 if pos is not None:
                     last = pos
-                    positions.append(pos)   # ★ v43：同步进聚类样本，避免众数漏帧
+                    # ★ v53：与 _watch 主循环同口径 —— 一律存局部坐标。
+                    #   v43 这里漏改，导致同一竿里 positions 混进屏幕坐标，
+                    #   聚类把 (557,296)屏幕→(917,506) 和真局部点分别成簇，
+                    #   最大簇可能是错的那一簇。
+                    _pl2 = self._to_local(pos)
+                    positions.append(_pl2 if _pl2 is not None else pos)
                 if last_bmp is not None and self._has_yellow_post(last_bmp):
                     post_bmp = last_bmp
                     post_at = time.monotonic() - start
@@ -1055,6 +1074,24 @@ class FishingBot:
                 self.log("追踪稳定位(局部): %s（最大簇 %d/%d 帧，需≥%d，跨度 %dpx）",
                          (int(stable[0]), int(stable[1])),
                          cnt, len(positions), need, span)
+                # ★ v53 自检：稳定位必须落在截屏区图像范围内。
+                #   v52 之前这里打印过 (910,511)，而截屏区只有 720x436
+                #   —— 屏幕坐标冒充局部坐标，肉眼一看就是错的。
+                #   现在再加一条越界告警，防止以后再混进去。
+                try:
+                    _g = getattr(self.bobber_finder, "grabber", None)
+                    _sa = _g.search_area() if _g is not None else None
+                    _bmp_chk = getattr(self.bobber_finder, "_bmp", None)
+                    if _sa and _bmp_chk is not None:
+                        _iw = int(_bmp_chk.shape[1])
+                        _ih = int(_bmp_chk.shape[0])
+                        if not (0 <= stable[0] < _iw and 0 <= stable[1] < _ih):
+                            self.log("⚠️ 追踪稳定位越界 局部(%d,%d) 不在截图区 %dx%d 内，"
+                                     "疑似坐标系混用，本竿不提供跟踪期锚点",
+                                     stable[0], stable[1], _iw, _ih)
+                            stable = None
+                except Exception as _e:
+                    self.log("追踪稳定位越界自检异常 %s", _e)
             else:
                 self.log("追踪位不稳: 最大簇 %d/%d 帧（需≥%d），跨度 %dpx（需≤60）"
                          " → 不提供跟踪期锚点",
