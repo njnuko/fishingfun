@@ -484,6 +484,7 @@ class SinkCalibrator:
 
         i = 0
         miss_run = 0
+        self._rejected_frames = 0      # ★ v50：被指纹判据否决的帧数（≠ 浮标离场）
         while True:
             now = time.monotonic()
             if now >= deadline:
@@ -516,6 +517,18 @@ class SinkCalibrator:
                 self.anchor_t = t
                 if self.anchor is not None:
                     self.log("标定锚点(本竿): 局部 %s", tuple(self.anchor))
+            elif (y is None and self.anchor is None
+                  and getattr(self.finder, "_last_fp_rejected", None) is not None):
+                # ★ v50：候选被指纹判据否决，但坐标是可信的（真机日志里
+                #   (378,114) 连续 3 帧不变）。标定期第一帧就撞上否决时，
+                #   宁可先用这个坐标当锚点，也不要整竿没有锚点。
+                m = re.search(r"@\((\d+),(\d+)\)", getattr(self, "_last_detect", "") or "")
+                if m:
+                    self.anchor = (int(m.group(1)), int(m.group(2)))
+                    self.anchor_t = t
+                    bw, bh, sz = self.finder._last_fp_rejected
+                    self.log("标定锚点(本竿): 局部 %s（取被否决候选 %dx%d area=%d）",
+                             tuple(self.anchor), bw, bh, sz)
             i += 1
             self.log("标定采样 %02d t=%.1fs y=%s area=%s 检测=%s",
                      i, t, y, area, getattr(self, "_last_detect", "-"))
@@ -532,12 +545,35 @@ class SinkCalibrator:
                 except Exception:
                     pass
             # 浮标已经不在画面里，继续采没有价值
+            #
+            # ★ v50 核心修复：这里以前把「y is None」一律当成「浮标离场」。
+            #   真机日志（720x529，09:27:52~09:27:57）打脸：
+            #     标定采样 06 t=5.1s y=None 检测=候选=0 最佳=63x166 size=491 @(378,114) 指纹否决26
+            #     标定采样 07 t=6.0s y=None 检测=候选=0 最佳=38x166 size=482 @(...) 指纹否决29
+            #     标定采样 08 t=7.0s y=None 检测=候选=0 最佳=62x166 size=461 @(...) 指纹否决25
+            #   检测明细里明明有候选（位置都在 (378,114) 附近、尺寸 38~63x166、
+            #   面积 461~491 和指纹 483 几乎一致），只是被指纹判据否决 →
+            #   find() 返回 None。于是 miss_run 连加 3，第 8 帧就
+            #   「判定浮标已离开画面」提前结束，17 秒窗口只跑了 4.3 秒。
+            #
+            #   现在分三种情况：
+            #     ① 真没候选（_last_fp_rejected 为空，且检测明细无 @坐标）→ 离场，计 miss；
+            #     ② 有候选但被判据否决 → 这是「检测器的问题」，不是「浮标走了」，
+            #        绝不计 miss，也绝不提前结束（否决的候选坐标还能兜底锚点）；
+            #     ③ 命中 → miss_run 清零。
             if y is None:
-                miss_run += 1
-                if miss_run >= 3 and i >= 5:
-                    self.log("标定: 连续 %d 帧未检测到浮标，提前结束采样"
-                             "（t=%.1fs，判定浮标已离开画面）", miss_run, t)
-                    break
+                rej = getattr(self.finder, "_last_fp_rejected", None)
+                note = getattr(self, "_last_detect", "") or ""
+                has_cand = (rej is not None) or ("@" in note)
+                if has_cand:
+                    # ② 候选在，只是被判据挡了：保持 miss_run 不动
+                    self._rejected_frames = getattr(self, "_rejected_frames", 0) + 1
+                else:
+                    miss_run += 1
+                    if miss_run >= 3 and i >= 5:
+                        self.log("标定: 连续 %d 帧画面内无任何候选，提前结束采样"
+                                 "（t=%.1fs，判定浮标已离开画面）", miss_run, t)
+                        break
             else:
                 miss_run = 0
             nxt = origin + i * interval
@@ -570,6 +606,12 @@ class SinkCalibrator:
             first_miss = next(t for (t, y, _a, _b) in all_pts if y is None)
             self.log("标定采样: %d/%d 帧命中，%d 帧丢失（首次丢失 t=%.1fs）",
                      len(seq), len(all_pts), n_miss, first_miss)
+        # ★ v50：把「被指纹判据否决」单独报出来。以前这些帧只显示 y=None，
+        #   和真·离场混在一起，日志上看不出是检测器判据太严。
+        n_rej = getattr(self, "_rejected_frames", 0)
+        if n_rej:
+            self.log("标定采样: 其中 %d 帧「有候选但被指纹判据否决」"
+                     "（浮标没走，是判据太严；本竿锚点已用候选坐标兜底）", n_rej)
         if len(seq) < 5:
             self.log("标定失败: 有效采样只有 %d 个（至少 5 个），沿用默认阈值", len(seq))
             return None

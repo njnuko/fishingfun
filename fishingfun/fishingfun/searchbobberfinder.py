@@ -180,6 +180,9 @@ class SearchBobberFinder:
         self._diff_anchor = None
         self._diff_hits = 0
         self._diff_prev = None
+        # ★ v50：本帧被指纹否决的最佳候选 (bw, bh, size)，供标定期把
+        #   「候选存在但被判据否决」和「画面里真的没有候选」区分开。
+        self._last_fp_rejected = None
 
     # 逐行对应 SearchBobberFinder.cs:34-57
     def find(self, bitmap=None):
@@ -472,6 +475,7 @@ class SearchBobberFinder:
         best = None
         n_ok = 0
         n_fp_rej = 0
+        self._last_fp_rejected = None      # ★ v50：每帧重置否决记录
         for size, x0, y0, x1, y1, cx, cy in blocks:
             if size < min_area:
                 continue
@@ -510,20 +514,35 @@ class SearchBobberFinder:
             # ★ v43：浮标指纹校验。首竿标定成功后记下面积/宽高基准，
             #   后续每竿拿候选跟基准比 —— 真机教训：顶部横带 area 1969~2423
             #   是基准（~360）的 5~7 倍，宽高比也偏扁，一眼该否决。
-            #   放宽到 [0.3x, 3.0x] 面积区间 + 长宽比接近，避免因远近/缩放误杀。
+            #
+            # ★ v50 核心改动：从「任一维不符就否决」改成「按维度投票，够两票就放行」。
+            #   真机证据（720x529，09:27:52~09:27:57 首竿标定）：
+            #     指纹 = 47x167 area=483
+            #     t=2.8s 候选 47x166 size=485  → 宽✓ 高✓ 面积✓（全过）
+            #     t=5.1s 候选 63x166 size=491  → 面积✓(1.02x) 高✓(0.99x) 宽✗(1.34x)
+            #     t=6.0s 候选 38x166 size=482  → 面积✓(1.00x) 高✓(0.99x) 宽✗(0.81x)
+            #     t=7.0s 候选 62x166 size=461  → 面积✓(0.95x) 高✓(0.99x) 宽✗(1.32x)
+            #   面积和高度都几乎一模一样，只有宽度在水面反光/浮标倾斜时抖动，
+            #   结果连续 3 帧全被「宽高比 2.2」这一票否决 → 判「浮标离场」→ 提前结束采样。
+            #   浮标被鱼往下拉时本来就会「变窄成竖条」（露出水面的部分变小），
+            #   所以宽度是最不该单独否决的一维。现在按三维投票：
+            #     宽 ±60% / 高 ±25% / 面积 ±35%，两维通过即放行。
+            #   顶部横带那个反例依然被拦：1969/360 = 5.5x 面积✗，
+            #   宽高比 5.5 也远超大横条形态 → 宽✗ 高✗，只剩面积一票 → 否决。
             fp = getattr(self, "bobber_fingerprint", None)
             if fp and fp.get("frames", 0) >= 5:
-                fa = fp.get("area") or 0
-                if fa:
-                    r = size / float(fa)
-                    if r < 0.3 or r > 3.0:
-                        n_fp_rej += 1
-                        continue                  # 面积偏离基准太多
-                fr = (fp.get("w", 0) / float(fp.get("h") or 1))
-                cr = bw / float(bh)
-                if fr > 0 and (cr / fr > 2.2 or fr / cr > 2.2):
+                fw, fh, fa = fp.get("w") or 0, fp.get("h") or 0, fp.get("area") or 0
+                votes = 0
+                if fw > 0 and 0.4 * fw <= bw <= 1.6 * fw:
+                    votes += 1
+                if fh > 0 and 0.75 * fh <= bh <= 1.25 * fh:
+                    votes += 1
+                if fa > 0 and 0.65 * fa <= size <= 1.35 * fa:
+                    votes += 1
+                if (fw or fh or fa) and votes < 2:
                     n_fp_rej += 1
-                    continue                  # 长宽比形态不符
+                    self._last_fp_rejected = (bw, bh, int(size))   # ★ v50：供标定期区分「否决」和「离场」
+                    continue                  # 三维里不够两票 → 否决
             n_ok += 1
             if best is None or size > best[0]:
                 best = (size, cx, cy, bw, bh)
