@@ -129,6 +129,26 @@ class SearchBobberFinder:
         self.calib_enabled = True
         self._calib_bmp = None           # post（_watch 最后一帧）
 
+    def clear_fingerprint(self):
+        """★ v64：丢掉旧浮标指纹（新的一局开始前调用）。
+
+        为什么需要：指纹是「浮标特征」的唯一载体，但它是跨竿残留的字段。
+        如果上一局（或上一次运行）留下的指纹还在，第 1 竿标定时
+        `_watch` 里那句 `bobber_fingerprint is None` 永远不成立 →
+        整局都沿用老指纹，等于从来没标定过。用户要求「第 1 竿的
+        浮标特征数据用来辅助判断后面每一竿」，所以每局必须先清空、
+        再由第 1 竿重新学。
+        """
+        old = getattr(self, "bobber_fingerprint", None)
+        self.bobber_fingerprint = None
+        if old:
+            try:
+                self.log("浮标指纹: 已清除上一局的旧指纹 %sx%s area=%s",
+                         old.get("w"), old.get("h"), old.get("area"))
+            except Exception:
+                pass
+        return old
+
     def learn_fingerprint(self, samples, log=None):
         """★ v43：首竿标定成功后，从多帧采样学习「浮标指纹」。
 
@@ -242,6 +262,49 @@ class SearchBobberFinder:
         保留空壳只为兼容旧调用点/测试；不要在这里恢复任何判定逻辑。
         """
         return False
+
+    def reset(self):
+        """每竿开始前清零本竿状态（重抛、首竿标定后都会调）。
+
+        ★ v62 事故记录：v62 首次发布时这个函数被误删。
+          起因是 _claim_decay() 退化成空壳时，它 return False 之后还残留着
+          本函数的**整个函数体**（缩进相同、恰好接在后面），清理那段"死代码"时
+          把 `def reset(self):` 这一行也一起删了 —— 结果 find() 的调用方
+          `self.finder.reset()` 每竿抛 AttributeError，日志刷
+          「ERR 'SearchBobberFinder' object has no attribute 'reset'」，
+          每竿 0.1 秒即重抛，一条鱼也钓不到。
+          ⚠️ 教训：删"死代码"必须先确认它前面有没有被吞掉的 def，
+             而且要跑一次**端到端调用**（不能只 py_compile）。
+        """
+        self.previous_location = None
+        self._area_hist = []      # 非原版：本竿面积历史，用于尺寸跳变判定
+        self._decay_claimed = False
+        # ★ v49：重抛后必须把「连续找不到浮标」的计数清零。
+        #   原来 reset() 没清，上一竿凑满 3 帧触发停机后计数器仍是 3，
+        #   新一竿第一帧再 miss 一次就立刻又到 3（no_bobber_limit=3），
+        #   等于重抛之后必然再次秒停 —— 「重抛继续」形同虚设。
+        self.no_bobber_frames = 0
+        # v37：每竿重置色差锚点，避免上一竿的浮标位置影响本竿
+        self._diff_anchor = None
+        self._diff_hits = 0
+        self._diff_prev = None
+        # ★ v50：本帧被指纹否决的最佳候选 (bw, bh, size)，供标定期把
+        #   「候选存在但被判据否决」和「画面里真的没有候选」区分开。
+        self._last_fp_rejected = None
+        # ★ v53：清掉上一竿的差分标定结果。
+        #   真机证据（2026-11-02 10:48:36，v53 首竿标定）：
+        #     「标定: 定位异常 '<' not supported between instances of 'int' and 'tuple'」
+        #   原因：_calib_result 是**上一竿**留下的一份字典（差分标定成功才写），
+        #   本竿走的是逐帧颜色搜索、根本没更新它。sinkcalib 却仍拿它取 area：
+        #     res.get("area", 0) → 那份字典里没有 area 键 → 0
+        #     → 退到 self.finder._last_count → 而 _last_count 全项目无人赋值
+        #     → getattr 拿到 None 走 else 分支? 不，真值路径里是个 tuple
+        #   最后 int(元组) 抛 TypeError，被 except 吞成一行「定位异常」，
+        #   这一帧的 y 就成了 None —— 标定 16/17 帧里丢的那 1 帧就是它。
+        #   跨竿残留一律在 reset() 清掉，本竿没做差分标定就不该有结果。
+        self._calib_result = None
+        self._last_count = None
+        self._last_detect_note = ""
 
     # 逐行对应 SearchBobberFinder.cs:34-57
     def find(self, bitmap=None):

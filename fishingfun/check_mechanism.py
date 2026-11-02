@@ -195,6 +195,53 @@ def main():
                 "【代码禁区】%s:%d 仍在调用 area_decayed()（面积衰减不得作为咬钩证据）\n"
                 "    %s" % (f, i, line.strip()[:140]))
 
+    # --- 规则 5：关键方法必须存在，且必须能被真正调用（v62 事故教训） ---
+    # v62 首发时 reset() 被误删，py_compile 完全通过（语法没问题），
+    # 但每竿调用即 AttributeError，一条鱼没钓到。编译不能代替端到端调用。
+    REQUIRED = {
+        "searchbobberfinder.py": ["reset", "find", "area_decayed", "_claim_decay"],
+        "fishbot.py": ["_wait_for_bite", "_loot", "_bite_from_decay"],
+    }
+    for fn, names in REQUIRED.items():
+        text = _src(fn)
+        if text is None:
+            continue
+        for nm in names:
+            if not re.search(r"^\s*def\s+%s\s*\(" % re.escape(nm), text, re.M):
+                problems.append(
+                    "【方法缺失】%s 里没有 def %s() —— 调用方会 AttributeError。\n"
+                    "    v62 首发事故就是 reset() 被误删导致每竿崩。" % (fn, nm))
+            elif VERBOSE:
+                print("  [检查] %s.%s() 存在" % (fn, nm))
+
+    # --- 规则 6：真实调用一次 reset()，不允许"能编译但一调就崩" ---
+    try:
+        sys.path.insert(0, ROOT)
+        from fishingfun.searchbobberfinder import SearchBobberFinder
+        probe = SearchBobberFinder.__new__(SearchBobberFinder)
+        probe.previous_location = (1, 2)
+        probe._area_hist = [(0, 100)]
+        probe.no_bobber_frames = 7
+        probe._calib_result = {"area": 1}
+        SearchBobberFinder.reset(probe)
+        bad = []
+        if probe.previous_location is not None:
+            bad.append("previous_location 未清")
+        if probe._area_hist:
+            bad.append("_area_hist 未清")
+        if probe.no_bobber_frames != 0:
+            bad.append("no_bobber_frames 未清")
+        if probe._calib_result is not None:
+            bad.append("_calib_result 未清")
+        if bad:
+            problems.append("【调用异常】reset() 实际执行后状态未复位: %s"
+                            % ", ".join(bad))
+        elif VERBOSE:
+            print("  [检查] reset() 实际调用通过，状态已复位")
+    except Exception as e:
+        problems.append("【调用异常】reset() 无法调用: %s: %s"
+                        % (type(e).__name__, e))
+
     print("=" * 62)
     print("FishingFun 机制一致性检查")
     print("=" * 62)

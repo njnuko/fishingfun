@@ -71,6 +71,10 @@ class FishingBot:
         self._last_cast_t = None
         # ★ v44：标定期记录的浮标锚点（截屏区局部坐标），每竿开头清空
         self._calib_anchor_local = None
+        # ★ v64：标记「本竿是不是纯标定竿」。标定竿只采样、不判咬钩、不右键，
+        #   17 秒走完直接收竿，从第 2 竿开始正常钓鱼。
+        self._calib_cast_done = False
+        self._calib_cast_armed = False
         self._area_armed_done = False   # 首竿标定截屏边界只做一次
         # ★ v45：日志/截图增强（用户要求每竿可复盘）
         self.save_regions = False   # True = 每竿锚定/咬钩/重抛都存区域图
@@ -227,6 +231,12 @@ class FishingBot:
                 self._calib_anchor_local = None
                 # ★ v61：每竿清空按秒轨迹采样（竿末打印成表）
                 self._cast_trace_reset()
+                # ★ v64：标定竿标记必须在按 4 键之前就定下来 ——
+                #   否则这一竿抛出去、17 秒窗口开始跑，才在
+                #   _maybe_calibrate_sink 里知道「这是标定竿」太晚。
+                self._calib_cast_armed = bool(
+                    getattr(self, "calib_sink", False)
+                    and not getattr(self, "_sink_calibrated", False))
                 self.wow_process.press_key(self.cast_key)
 
                 # 第一次抛竿后：绿条出现，此刻才量边界，量一次就永久锁定。
@@ -1167,12 +1177,30 @@ class FishingBot:
         都是 yDiff=-4，且都在开始监控后 2 秒内，那是波纹不是鱼。
         不同钓点/分辨率下真实下沉幅度不同，只能实测。
 
-        采样期间浮标还没进入咬钩监控，所以这 17 秒的鱼咬钩不会被
-        误判；采完把 strike_value 改成实测值，本竿照常继续。
+        ⭐ 用户规定的流程（v64 起严格执行）：
+          第 1 竿 = 纯标定竿，整个 17 秒只干一件事：把两个特征值量出来。
+            ① 浮标特征（指纹：尺寸/面积/颜色）→ 后面每竿用它辅助判断
+               「这么多候选里哪个才是我的浮标」
+            ② 咬钩特征（下沉幅度 strike_value）→ 后面每竿用它判断
+               「浮标这一下算不算咬钩」
+          这 17 秒里即便真咬钩了也 **不右键**（浮标会消失，17 秒窗口直接废掉，
+          数据就不准了）。17 秒走完 → 收掉这一竿 → 从第 2 竿开始正常钓鱼。
+          每竿的锚点都是现场重新判定的（落点每次都不一样），
+          第 1 竿的锚点绝不搬给后面的竿用。
         """
+        self._calib_anchor_local = None
+        self._calib_cast_done = False
+        try:
+            self.bobber_finder.clear_fingerprint()
+        except Exception as e:
+            self.log("⚠️ 旧浮标指纹清理失败（将按无指纹运行）: %s", e)
         if not self.calib_sink or self._sink_calibrated:
             return
         self._sink_calibrated = True      # 无论成败都只做一次
+        self._calib_cast_done = True      # ★ v64：本竿是纯标定竿
+        self.log("━━ 第 %d 竿 = 纯标定竿：整 %.0f 秒只采样两个特征值"
+                 "（浮标特征 + 咬钩特征），期间不判咬钩、不右键 ━━",
+                 getattr(self, "_cast_no", 0), float(self.sink_calib_seconds))
         # 标定期间浮标本来就会漂/沉，找不到不算「这个钓点太暗」
         self.bobber_finder.suppress_abort = True
         # ★ v38：标定期连 no_bobber_frames 也要冻结。
@@ -1198,9 +1226,9 @@ class FishingBot:
             # v38：把按键时刻传进去 —— 17 秒从按下 4 键算起（含飞行时间），
             # 采样窗口必须和游戏计时对齐，否则前几秒（含落水瞬间）全丢。
             got = calib.run(t_key=getattr(self, "_last_cast_t", None))
-            # ★ v44：把标定期记录的「浮标本竿锚点」交给 _wait_for_bite。
-            #   用户规定的流程：第 1 竿只标定（浮标特征 + 咬钩浮动值），
-            #   标定完直接用这个锚点，不重新找、不做现场验证。
+            # ★ v44：把标定期记录的「浮标本竿锚点」记录下来。
+            #   ★ v64：只做取证，不再交给 _wait_for_bite 复用 ——
+            #   用户反复强调：后面每一竿落点都不同，锚点必须每竿现场重定。
             try:
                 self._calib_anchor_local = getattr(calib, "anchor", None)
                 if self._calib_anchor_local is not None:
@@ -1636,6 +1664,22 @@ class FishingBot:
 
     # ---- 逐行对应 FishBot.cs:94-125 ----
     def _wait_for_bite(self):
+        # ★ v64：纯标定竿到此为止 —— 17 秒采样已经走完，两支特征值都落盘了。
+        #   这一竿全程没判过咬钩、没右键过（标定期连 abort 都是关的），
+        #   现在直接收掉，从下一竿开始正常钓鱼。
+        if getattr(self, "_calib_cast_done", False):
+            self._calib_cast_done = False
+            self.log("标定竿结束：浮标特征 + 咬钩特征已采完，收竿重抛，"
+                     "从第 %d 竿开始正常钓鱼（每竿锚点现场重定）",
+                     getattr(self, "_cast_no", 0) + 1)
+            self._cast_trace_report("标定竿完成（纯采样，不判咬钩）")
+            try:
+                self.bobber_finder.previous_location = None
+                self.bobber_finder.no_bobber_frames = 0
+                self.bobber_finder.suppress_abort = False
+            except Exception:
+                pass
+            return
         self.bobber_finder.reset()
 
         # ★ v41：如果 _watch(2000) 跟踪期已经稳定锁定过浮标，标定结束后
