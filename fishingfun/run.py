@@ -284,8 +284,8 @@ def main():
             "开" if bot.save_regions else "关",
             "开" if bot.frame_log else "关", bot.trace_seconds)
         log("  · 每竿锚点会存 debug/cNNN_锚定_区域WxH@原点_t秒_锚点x_y_*.bmp")
-        log("  · 只有「锚定 / 咬钩 / 重抛 / 跟踪逐秒」四类帧会落盘"
-            "（每帧都存会让帧率减半，反而漏判）")
+        log("  · 落盘规则：判咬钩循环每 %.1f 秒存 1 张（下沉≥3px 时切 200ms 1 张）；"
+            "锚定/咬钩/重抛/首竿标定等关键节点强制存", bot.save_interval_sec)
 
     # 激活游戏窗口（SendInput 需要目标窗口在前台，PostMessage 不需要）
     if args.key_mode != "postmessage" and screen._hwnd:

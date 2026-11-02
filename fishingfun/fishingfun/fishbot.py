@@ -1912,10 +1912,44 @@ class FishingBot:
             #   等于白记 —— 而「这一帧检测到哪儿、y 是多少」正是复盘的核心。
             self._last_detect_xy = ([int(current[0]), int(current[1])]
                                     if current is not None else None)
-            if current is not None:
-                self.bite_watcher._last_y = int(current[1])
             if current is None and _dt > 0.4:
                 self.log("单帧扫描耗时 %.2fs（浮标可能已消失）", _dt)
+
+            # ★ v57 核心修复（B）：跳变作废门限（横向 + 纵向）。
+            #   真机证据（debug.zip c002__咬钩前_t12.1s）：
+            #     本竿锚点 (655,334)，检测点突然变成 (977,259) —— Δx=+322, Δy=-75，
+            #     于是 yDiff=-76 被当成「浮标下沉」直接判咬钩。
+            #     但那一帧的 (977,259) 是**船体/水面亮线**，不是浮标：
+            #     真浮标 20 帧里 17 帧稳定在 (655,334)±1px，从未移动过。
+            #   判定条件（任一成立即本帧作废）：
+            #     ① 横向跳 > max(3×浮标宽, 40px)  —— 浮标拴在鱼线上，横向几乎不动
+            #     ② 纵向跳 > max(6×strike_value, 40px) —— 真实下沉是逐帧 2~8px，
+            #        一帧跳 70px 只可能是换了检测目标（实测 strike_value 标定 4~6，
+            #        上界 6×6=36 取 40 兜底，仍远小于船体造成的 72px 误差）
+            #   作废帧不喂 watcher：既不污染 y 基准，也不参与咬钩判定。
+            if current is not None and bobber_position is not None:
+                _adx = abs(int(current[0]) - int(bobber_position[0]))
+                _ady = abs(int(current[1]) - int(bobber_position[1]))
+                _bw = getattr(self.bobber_finder, "_last_block", None)
+                _bwid = (_bw[1] if _bw else 20) or 20
+                _xgate = max(3.0 * _bwid, 40.0)
+                _strike = getattr(self.bite_watcher, "strike_value", 6) or 6
+                _ygate = max(6.0 * float(_strike), 40.0)
+                _jx = _adx > _xgate and _adx > 3.0 * _ady
+                _jy = _ady > _ygate
+                if _jx or _jy:
+                    self.log("检测跳变: (%d,%d) → (%d,%d) Δx=%d(限%d) Δy=%d(限%d)，"
+                             "判为换目标/检测丢失，本帧不参与咬钩判定",
+                             bobber_position[0], bobber_position[1],
+                             current[0], current[1],
+                             _adx, int(_xgate), _ady, int(_ygate))
+                    current = None
+
+            # ★ v57：y 基准只吃「通过门限」的检测点。
+            #   原来这行在门限之前，船开过时假点 (332,72) 会把 y 基准拽走
+            #   70+ px，之后真浮标回来 yDiff 立刻变成 +70 → 反向误判。
+            if current is not None:
+                self.bite_watcher._last_y = int(current[1])
 
             # ★ v55：判咬钩循环按秒存图（用户要求「debug 图每秒存一次就行」）。
             #   之前这一段一帧图都不存，离线复盘时只能看到「yDiff=6 命中」这种

@@ -149,7 +149,17 @@ class SearchBobberFinder:
           则认为是渐进缩小 → 咬钩。
 
         与「一步归零」的区别：一步归零时面积没有中间样本，条件②③不成立。
+
+        ★ v57 加强（C）：要求「至少 2 次连续递减」，拒绝单帧断崖。
+          真机反例（debug.zip c002 第 2 竿，2026-11-02）：
+            序列 237, ..., 200, 71 → 71/237=0.30，被判「渐进缩小→咬钩」。
+            但 200→71 是**一帧内掉 65%**，中间没有任何过渡样本 ——
+            浮标被鱼拉是连续的（每帧缩几个点），不会是台阶式断崖。
+            断崖更像「检测块被水面反光遮住半个」或「块被相邻色块吃掉」。
+          判据：相邻样本的比值下降次数 ≥2，且单步跌幅 ≤ 55%
+                （50 帧量级的真实下沉约每帧 2~8%，绝无单帧 65%）。
         """
+        # ★ v57（C）：面积衰减必须逐帧连续，拒绝单帧断崖
         hist = [h for h in getattr(self, "_area_hist", [])
                 if time.time() - h[0] <= window]
         if len(hist) < 3:
@@ -163,6 +173,16 @@ class SearchBobberFinder:
         # 允许 5% 抖动，但整体不能回升
         for i in range(1, len(areas)):
             if areas[i] > areas[i - 1] * 1.05:
+                return False
+        min_steps = 2          # 至少 2 次相邻递减
+        max_step_drop = 0.55   # 单步最多跌 55%
+        for i in range(1, len(areas)):
+            _r = areas[i] / float(areas[i - 1]) if areas[i - 1] else 0.0
+            if _r < (1.0 - max_step_drop):
+                # 断崖：本帧直接掉了超过 55%。拒绝，并说明原因。
+                self.log("面积衰减否决: %s 出现单帧断崖 %.2f 倍（>%.0f%%），"
+                         "判为遮挡/换目标而非鱼拉浮标",
+                         areas, _r, max_step_drop * 100)
                 return False
         self.log("面积衰减序列 %s → %d/%d=%.2f，判为浮标被拉入水面（咬钩）",
                  areas, last, first, last / float(first))
@@ -533,6 +553,9 @@ class SearchBobberFinder:
         best = None
         n_ok = 0
         n_fp_rej = 0
+        n_far = 0                          # ★ v57：因「跳太远」被淘汰的候选数
+        # ★ v57：上一帧位置（局部坐标）。首次搜索时为 None，不做就近约束。
+        prev_loc = getattr(self, "previous_location", None)
         self._last_fp_rejected = None      # ★ v50：每帧重置否决记录
         # ★ v53：候选分级。暖色块（含真浮标）全部被否决后，才用亮团块再找一遍。
         #   单帧只做一级，日志里能看出用的是哪一级。
@@ -617,6 +640,21 @@ class SearchBobberFinder:
                     n_fp_rej += 1
                     self._last_fp_rejected = (bw, bh, int(size))
             n_ok += 1
+            # ★ v57 核心修复（A）：已有上一帧位置时，淘汰「跳太远」的候选。
+            #   真机证据（debug.zip c002，720x456@360,190，2026-11-02）：
+            #     真浮标局部 (295,144)，20 帧里 17 帧稳定在 ±1px；
+            #     另有 3 帧 find() 返回 (617,69)/(332,72)/(475,58) ——
+            #     全部落在截屏区顶部 UI 暖色带（y=0~75），面积 2968~3768，
+            #     是真浮标（~360）的 8~10 倍，「按面积排序」必然让它们胜出。
+            #   实测该帧 6 个 UI 块 dx=100~241 / dy=79~128，全部被本判据淘汰。
+            #   阈值 3×浮标宽：浮标被鱼往下拉时的真实位移是几十 px，
+            #   水面起伏 ±2px，3 倍宽（约 60~90px）足够宽松，只挡真跳变。
+            if prev_loc is not None:
+                _gate = max(3.0 * max(bw, bh), 40.0)
+                if (abs(cx - prev_loc[0]) > _gate
+                        or abs(cy - prev_loc[1]) > _gate):
+                    n_far += 1
+                    continue
             # 排序键：指纹吻合优先，其次面积大
             score = size * (1.0 + 0.25 * bonus)
             if best is None or score > best[0]:
@@ -630,6 +668,8 @@ class SearchBobberFinder:
                 "%dx%d size=%d @(%d,%d)" % (best[3], best[4],
                                             int(best[0]), best[1], best[2]),
                     (" 尺寸偏离%d(不否决)" % n_fp_rej) if n_fp_rej else ""))
+            if n_far:
+                self._last_detect_note += " 跳远淘汰%d" % n_far
         except Exception:
             pass
         if best is None:
