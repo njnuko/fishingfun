@@ -67,6 +67,23 @@ class SearchBobberFinder:
         # 上层注册：连续 N 次找不到浮标时回调（用来停止程序 + 提示用户）
         self.no_bobber_frames = 0
         self.no_bobber_limit = 3
+        # ★ v59：abort 之前的「衰减裁决」回调。
+        #   真机证据（2026-11-02 13:46 v59 日志，第 2 竿）：
+        #     浮标面积 271→269→225→220→219→216→217→213→211→205→201→195→112→消失，
+        #     连续单调缩小 —— 就是鱼把浮标往水里拉。但 _wait_for_bite 里的
+        #     area_decayed() 判据根本没轮到执行：find() 内部浮标一消失，
+        #     no_bobber_frames 3 帧（约 150ms）就调 abort_cb → _soft_stop →
+        #     本竿立即结束重抛，证据全废，白放跑一条鱼。
+        #   这里在上层 abort 之前先问一句「这是不是面积衰减式咬钩」，
+        #   返回 True 表示上层已按咬钩处理（本竿正常结束），不再走 abort。
+        self.decay_claim_cb = None
+        # ★ v60：浮标存活期（秒）。抛竿后浮标在水面露头约 17 秒，
+        #   17 秒一到游戏自动收杆、浮标消失。判定咬钩时必须先看时间：
+        #   超过这个时刻才消失的，基本都是到期收杆，不是鱼咬。
+        #   16.5 = 17 秒减去 0.5 秒的判定延迟余量。
+        self.bite_deadline_s = 16.5
+        # 上层注入：返回「距本竿抛竿按键已过多少秒」。
+        self.seconds_since_cast = None
         # 飞行期/首竿标定期置 True：此时找不到浮标不累计、不停机
         self.suppress_abort = False
         # v37：飞行期置 True —— 允许检出色差候选（用于日志/差分），
@@ -203,9 +220,66 @@ class SearchBobberFinder:
                  areas, last, first, last / float(first))
         return True
 
+    def _claim_decay(self):
+        """★ v60：abort 之前的裁决 —— 但**必须**结合 17 秒浮标存活期。
+
+        ⚠️ v60 第一版写错过，这里记录清楚，防止再犯：
+          当时仅凭「面积渐进缩小」就判咬钩，理由是 13:46:07 第 2 竿
+          序列 271→225→219→216→211→205→201→195→112→消失 单调缩小。
+          但把三竿时间对齐后真相是：
+            第1竿 抛竿 13:45:30.542 → 消失 13:45:49.200（+18.66s）
+            第2竿 抛竿 13:45:49.660 → 消失 13:46:08.102（+18.44s）
+            第3竿 抛竿 13:46:08.557 → 咬钩 13:46:27.294（+18.74s）
+          第1、2 竿消失前面积序列**逐帧完全一致**（…195,112,158,97,80,70），
+          这是 17 秒到期、游戏自动收杆时浮标被收起的固定动画，
+          根本不是鱼在拉。若按面积判咬钩，这两竿会朝空气右键。
+          真正的区别在**形变方式**：
+            · 到期收杆 → 只有面积缩，y 坐标几乎不动（第1/2竿 y 恒定）
+            · 鱼咬钩   → **y 位移**（第3竿 401→420→425，位移 24px）
+        所以：面积衰减不能单独作为咬钩判据。
+
+        现在本函数只在「距抛竿 < 到期余量」且面积衰减成立时才认咬钩，
+        其余一律放行给 abort（= 本竿正常结束、重抛）。
+        返回 True = 上层已按咬钩处理；False = 正常走 abort。
+        """
+        cb = getattr(self, "decay_claim_cb", None)
+        if cb is None:
+            return False
+        # ★ 17 秒门控：距抛竿不足 N 秒的消失才可能是咬钩；
+        #   过了这个点，浮标消失基本都是到期自动收杆。
+        el = None
+        elapsed = getattr(self, "seconds_since_cast", None)
+        if callable(elapsed):
+            try:
+                el = float(elapsed())
+            except Exception:
+                el = None
+        deadline = float(getattr(self, "bite_deadline_s", 16.5))
+        if el is not None and el >= deadline:
+            self.log("浮标消失于抛竿后 %.1fs（≥%.1fs 浮标存活期）→ "
+                     "判为 17 秒到期自动收杆，不是咬钩，不拾取",
+                     el, deadline)
+            return False
+        try:
+            decayed = self.area_decayed()
+        except Exception as e:
+            self.log("衰减裁决异常: %s", e)
+            return False
+        if not decayed or getattr(self, "_decay_claimed", False):
+            return False
+        self._decay_claimed = True
+        self.log("★ abort 前裁决：%s 处面积渐进缩小至消失 → 判为咬钩（未到期）",
+                 ("%.1fs" % el) if el is not None else "未知时刻")
+        try:
+            cb()
+        except Exception as e:
+            self.log("衰减裁决回调异常: %s", e)
+        return True
+
     def reset(self):
         self.previous_location = None
         self._area_hist = []      # 非原版：本竿面积历史，用于尺寸跳变判定
+        self._decay_claimed = False
         # ★ v49：重抛后必须把「连续找不到浮标」的计数清零。
         #   原来 reset() 没清，上一竿凑满 3 帧触发停机后计数器仍是 3，
         #   新一竿第一帧再 miss 一次就立刻又到 3（no_bobber_limit=3），
@@ -297,6 +371,8 @@ class SearchBobberFinder:
                          self.no_bobber_frames, self.no_bobber_limit)
                 if (self.abort_cb is not None
                         and self.no_bobber_frames >= self.no_bobber_limit):
+                    if self._claim_decay():
+                        return None
                     self.abort_cb(self.no_bobber_frames)
                 return None
 
@@ -344,6 +420,8 @@ class SearchBobberFinder:
             self.log("暖色像素为 0，判本帧无浮标（不放行 TAN 兜底）")
             if (self.abort_cb is not None
                     and self.no_bobber_frames >= self.no_bobber_limit):
+                if self._claim_decay():
+                    return None
                 self.abort_cb(self.no_bobber_frames)
             return None
 

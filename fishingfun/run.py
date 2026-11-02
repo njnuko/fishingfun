@@ -200,10 +200,28 @@ def main():
             log("标定期间连续 %d 帧找不到浮标（浮标被咬走/离场属正常），不判停机", n)
             return
         if getattr(bot, "_anchor_locked_this_cast", False):
-            log("=" * 60)
-            log("⚠️  连续 %d 帧找不到浮标 —— 本竿已锁定过浮标，判为目标消失/咬钩", n)
-            log("⚠️  不提示换钓点，重抛继续。")
-            log("=" * 60)
+            # ★ v60：按 17 秒浮标存活期（见 FISHING_MECHANISMS.md）区分语义。
+            #   17s 到期 → 游戏自动收杆，浮标消失是必然的正常事件；
+            #   <17s 消失 → 鱼把浮标拉下去了，这才是真咬钩。
+            _el = None
+            try:
+                _t = getattr(bot, "_last_cast_t", None)
+                if _t:
+                    _el = time.monotonic() - _t
+            except Exception:
+                _el = None
+            _dl = float(getattr(finder, "bite_deadline_s", 16.5))
+            if _el is not None and _el >= _dl:
+                log("=" * 60)
+                log("⏱  浮标消失于抛竿后 %.1fs —— 17 秒存活期到，游戏自动收杆（正常）", _el)
+                log("   本竿无鱼（或已自行收杆），直接重抛。")
+                log("=" * 60)
+            else:
+                log("=" * 60)
+                log("⚠️  连续 %d 帧找不到浮标 —— 抛竿后 %.1fs，未到 17 秒存活期",
+                    n, _el if _el is not None else -1)
+                log("   判为鱼咬钩拉走浮标 / 目标离场，本竿结束，重抛继续。")
+                log("=" * 60)
             # ★ v49：这里原来直接 is_enabled=False，于是「重抛继续」之后
             #   下一行必定是 Bot has Stopped —— 真机日志 08:56:33 的停机
             #   就是这么来的。现在只标记「本轮结束，可恢复」，

@@ -141,7 +141,19 @@ class WowProcess:
         u.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
 
     # ---- 逐行对应 WowProcess.cs:156-174 ----
-    def right_click_mouse(self, position):
+    def right_click_mouse(self, position, verify_tries=3, tol=6):
+        """右键点击 position 拾取。
+
+        ★ v60：落点校验 + 重试。
+          真机证据（2026-11-02 13:46 v59，1440x900，第 4 竿）：
+            目标=(723,401) 光标实际=(1404,448) 差=(+681,+47)
+          光标没停在目标上就照常右键 → 点空、拾取失败，而日志后面
+          仍然统计成「真咬钩」，等于静默丢鱼。
+          11-01 日志里 7 次拾取有 6 次差 (+0,+0)、1 次差 (+560,+362)，
+          说明是偶发（UU 远程端鼠标 / 游戏中心锁定抢光标），
+          不是坐标算错。做法：移动后回读，偏差 > tol 就重移，最多
+          verify_tries 次；仍未命中则用 SetCursorPos 兜底硬设一次。
+        """
         x, y = int(position[0]), int(position[1])
 
         _button(MOUSEEVENTF_RIGHTUP)              # ① 先补一个右 UP（原版第 1 行）
@@ -150,11 +162,37 @@ class WowProcess:
         time.sleep(0.200)
         move_cursor(x, y)                         # ② Cursor.Position = position
         time.sleep(0.050)                         # ★ 给游戏一帧时间处理光标
-        time.sleep(self.LootDelay / 1000.0)       # ③ LootDelay = 2000ms，不能跳
 
         got = get_cursor_pos()
-        self.log("拾取: 目标=(%d,%d) 光标实际=(%d,%d) 差=(%+d,%+d)",
-                 x, y, got[0], got[1], got[0] - x, got[1] - y)
+        tries = 1
+        while (abs(got[0] - x) > tol or abs(got[1] - y) > tol) and tries < verify_tries:
+            tries += 1
+            self.log("拾取: 落点偏移 (目标 %d,%d 实际 %d,%d 差 %+d,%+d)，第 %d 次重移",
+                     x, y, got[0], got[1], got[0] - x, got[1] - y, tries)
+            move_cursor(x, y)
+            time.sleep(0.050)
+            got = get_cursor_pos()
+
+        if abs(got[0] - x) > tol or abs(got[1] - y) > tol:
+            # 兜底：SetCursorPos 走的是另一条内核路径（不受 SendInput 的
+            # 输入队列/焦点影响），Remote Desktop/UU 抢光标时通常仍生效。
+            try:
+                _user32().SetCursorPos(x, y)
+                time.sleep(0.050)
+                got = get_cursor_pos()
+            except Exception as e:
+                self.log("拾取: SetCursorPos 兜底失败 %s", e)
+
+        time.sleep(self.LootDelay / 1000.0)       # ③ LootDelay = 2000ms，不能跳
+
+        off = (got[0] - x, got[1] - y)
+        if abs(off[0]) > tol or abs(off[1]) > tol:
+            self.log("⚠️ 拾取: 目标=(%d,%d) 光标实际=(%d,%d) 差=(%+d,%+d) —— "
+                     "光标未能到目标，本次右键大概率无效",
+                     x, y, got[0], got[1], off[0], off[1])
+        else:
+            self.log("拾取: 目标=(%d,%d) 光标实际=(%d,%d) 差=(%+d,%+d)（重试 %d 次）",
+                     x, y, got[0], got[1], off[0], off[1], tries - 1)
 
         _button(MOUSEEVENTF_RIGHTDOWN)            # ④
         time.sleep((30 + self._random.randrange(0, 47)) / 1000.0)

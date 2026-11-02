@@ -1,11 +1,24 @@
 """钓鱼主循环 —— 严格复刻 Source/FishingFunBot/Bot/FishBot.cs（210 行）
 
+════════════════════════════════════════════════════════════════════
+★★ 游戏机制（用户 2026-11-02 明确说明，所有判定设计的前提）★★
+  抛竿后浮标在水面停留 **17 秒**。这 17 秒内：
+    · 浮标必定会出现「咬钩」—— 表现为浮标晃动（下沉/抖动）;
+    · 17 秒一到，游戏 **自动收杆**，浮标消失，水面不再有浮标;
+    · 也就是说：「浮标消失」有两种完全不同的含义 ——
+        (a) 17 秒到期自动收杆 → 正常，重抛即可，**不是咬钩**;
+        (b) 咬钩后浮标沉入水下   → **是咬钩**，必须立刻右键拾取。
+      两者的区别靠「距抛竿过了多久」+「消失前有没有晃动」来区分。
+  ⇒ 所以任何「找不到浮标就判咬钩」的写法都是错的，必须结合时间与
+    消失前的形变证据。参见 _wait_for_bite 顶部说明与 area_decayed()。
+════════════════════════════════════════════════════════════════════
+
 关键点（一个都不能省，省了就「只抛竿不拾取」）：
   · PressKey(castKey) 之后必须 Watch(2000) 收敛基准
   · WaitForBite() 用 FindBobber() 找到的「抛竿位置」做 biteWatcher.Reset
     这个位置整竿固定，Loot 就传它（不是咬钩瞬间坐标）
   · Watch() 里只做 bobberFinder.Find()，不做别的（不要加命中率统计）
-  · 超时 25 秒 / 检查间隔 25ms
+  · 判咬钩窗口 = 抛竿后 17 秒（游戏浮标存活期），不是 25 秒
 """
 
 import time
@@ -188,6 +201,22 @@ class FishingBot:
                 # ★ v41：每竿开始清零「本竿锁定过浮标」标志，
                 #   供 run.py 的 _on_no_bobber 区分「从没锁定」和「锁定后又丢」。
                 self._anchor_locked_this_cast = False
+                # ★ v59：每竿清掉衰减裁决回调与「本竿已按咬钩收尾」标记。
+                #   回调在 _verify_and_watch 里按本竿锚点重新注册；不清会让
+                #   上一竿的锚点坐标残留到下一竿的拾取点击上。
+                self._bite_handled_this_cast = False
+                try:
+                    self.bobber_finder.decay_claim_cb = None
+                except Exception:
+                    pass
+                # ★ v60：注入「距本竿抛竿已过多少秒」。
+                #   17 秒浮标存活期的判定（到期收杆 vs 鱼咬钩）靠它。
+                try:
+                    self.bobber_finder.seconds_since_cast = (
+                        lambda: (time.monotonic() - self._last_cast_t)
+                        if getattr(self, "_last_cast_t", None) else 0.0)
+                except Exception:
+                    pass
                 # ★ v43：每竿都清零，避免上一竿的稳定锁定标记污染本竿的
                 #   差分交叉校验（原来 _anchor_color_stable 只在 _watch 里赋值，
                 #   异常路径下会残留上一竿的 True）。
@@ -1858,6 +1887,14 @@ class FishingBot:
         # 非原版：锚点可信度检查。若 2 秒跟踪期命中帧占比过低（<45%），
         # ★ v41：走到这里说明本竿已经拿到锚点位置，标记下来供停机文案判断。
         self._anchor_locked_this_cast = True
+        # ★ v59：注册「abort 前衰减裁决」回调。
+        #   浮标消失到撞上 no_bobber_limit 只有 3 帧（≈150ms），
+        #   _wait_for_bite 主循环里的 area_decayed() 分支永远等不到那一帧；
+        #   必须由 find() 在 abort 之前回调进来，这里就地完成拾取。
+        #   只会被调一次（finder 侧 _decay_claimed 每竿清零）。
+        def _on_decay_bite(_pos=(bobber_position[0], bobber_position[1])):
+            self._bite_from_decay(_pos)
+        self.bobber_finder.decay_claim_cb = _on_decay_bite
         # 说明真鱼鳔大部分帧检测不到，锚点很可能是旁边别的米黄物体，
         # 整个 25 秒都会拿它当基准 → 满屏误判。直接放弃本竿重抛。
         track = getattr(self, "_last_track", None)
@@ -2014,13 +2051,7 @@ class FishingBot:
                         self.log("面积衰减判定异常 %s", e)
                         decayed = False
                     if decayed:
-                        self.log("咬钩判定: 浮标面积渐进缩小至消失 → 判为咬钩")
-                        self._dump_region("咬钩衰减", extra="锚点%d_%d" % (
-                            bobber_position[0], bobber_position[1]))
-                        # ★ v55：衰减式咬钩同样取证
-                        self._forensic_bite(None, bobber_position, "面积渐进衰减")
-                        self._loot(bobber_position)
-                        self._press_ten_min_key_if_due()
+                        self._bite_from_decay(bobber_position)
                         return
                 if current is not None and current[0] == 0:
                     return
@@ -2062,6 +2093,49 @@ class FishingBot:
                          int(getattr(self.bite_watcher, "strike_value", 0)))
 
     # ---- 逐行对应 FishBot.cs:164-168 ----
+    def _bite_from_decay(self, bobber_position):
+        """★ v59：面积渐进衰减式咬钩的统一处理（主循环分支 + abort 前回调共用）。
+
+        真机依据见 searchbobberfinder.area_decayed() 与 _claim_decay()。
+        两条触发路径：
+          ① _wait_for_bite 主循环 current is None 时（旧路径，很少能轮到）
+          ② find() 即将 abort 前的 decay_claim_cb（新路径，实测走这条）
+
+        ★ v60：17 秒门控在这里统一实施，两条路径都绕不过去。
+          否则主循环那条路径会在 17 秒到期收杆时照样右键空气。
+        """
+        # ── 17 秒存活期门控（见 FISHING_MECHANISMS.md 第 1 节）──
+        _el = None
+        try:
+            _f = getattr(self.bobber_finder, "seconds_since_cast", None)
+            if callable(_f):
+                _el = float(_f())
+        except Exception:
+            _el = None
+        _dl = float(getattr(self.bobber_finder, "bite_deadline_s", 16.5))
+        if _el is not None and _el >= _dl:
+            self.log("面积衰减发生在抛竿后 %.1fs（≥%.1fs 浮标存活期）→ "
+                     "判为 17 秒到期自动收杆，不拾取", _el, _dl)
+            return
+        if getattr(self, "_bite_handled_this_cast", False):
+            return
+        self.log("咬钩判定: 浮标面积渐进缩小至消失（抛竿后 %s）→ 判为咬钩",
+                 "%.1fs" % _el if _el is not None else "未知")
+        try:
+            self._dump_region("咬钩衰减", extra="锚点%d_%d" % (
+                bobber_position[0], bobber_position[1]))
+        except Exception as e:
+            self.log("衰减咬钩存图失败: %s", e)
+        try:
+            self._forensic_bite(None, bobber_position, "面积渐进衰减")
+        except Exception as e:
+            self.log("衰减咬钩取证失败: %s", e)
+        self._loot(bobber_position)
+        self._press_ten_min_key_if_due()
+        # 本竿到此结束：finder 侧已判过衰减，abort_cb 不能再把整轮打成
+        # 「目标消失 → 重抛」；这里只标记本竿收尾，主循环正常进下一竿。
+        self._bite_handled_this_cast = True
+
     def _loot(self, bobber_position):
         # 收竿前先拍一张「基准」：如果这行字本来就还挂在屏幕上（上一竿残留），
         # 之后就不能把它当成这一竿的结果。
