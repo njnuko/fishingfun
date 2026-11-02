@@ -176,6 +176,42 @@ class WowProcess:
         move_cursor(sw - 1, sh - 1)
 
     @staticmethod
+    def park_cursor_verified(tries=3, tol=4):
+        """把鼠标移到屏幕边缘并【回读校验】，不在边缘就重试。
+
+        ★ v54：用户明确要求「每次抛竿前把鼠标移到屏幕边缘」。
+        原来 start() 里只调一次 park_cursor() + 回读，回读失败只打警告、
+        不做任何补救。真机若恰好在那一刻被游戏抢焦点/DPI 换算偏移，
+        光标就留在画面中间，悬停提示会盖住浮标。
+
+        本函数按右下角 → 右上角 → 左下角 依次尝试，每次移动后回读确认；
+        全部失败返回 False，由调用方记日志。
+
+        返回 (ok, (x, y)) —— 实际落点，便于日志审计。
+        """
+        try:
+            sw, sh = _screen_size()
+        except Exception:
+            return (False, (0, 0))
+        # 依次尝试的边角。右下角优先（离浮标最远）。
+        targets = [(sw - 1, sh - 1), (sw - 1, 1), (1, sh - 1), (1, 1)]
+        last = (0, 0)
+        for tx, ty in targets:
+            for _ in range(max(1, int(tries))):
+                try:
+                    move_cursor(tx, ty)
+                except Exception:
+                    continue
+                try:
+                    x, y = get_cursor_pos()
+                except Exception:
+                    return (False, (0, 0))
+                last = (x, y)
+                if abs(x - tx) <= tol and abs(y - ty) <= tol:
+                    return (True, last)
+        return (False, last)
+
+    @staticmethod
     def cursor_is_parked(tol=4):
         """当前光标是否已经停靠在角落（park 生效校验用）。"""
         try:

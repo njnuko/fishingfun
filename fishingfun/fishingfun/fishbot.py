@@ -132,18 +132,26 @@ class FishingBot:
             try:
                 self._cast_no += 1
                 self.log("Pressing key %s to Cast.", self.cast_key)
-                # 非原版：抛竿前先把光标停到屏幕右下角，避免鼠标悬停在抛竿点附近
-                # 挡住浮标 / 弹出悬停提示干扰 tan 判定
+                # 非原版：抛竿前先把光标移到屏幕边缘，避免鼠标悬停在抛竿点附近
+                # 挡住浮标 / 弹出悬停提示干扰判定
                 # ★ v52：park_cursor 以前是坏方法（漏 self）又被 except 吞掉，
-                #   等于没停。现在挪到 press_key 之前、抛竿前先移开，并回读光标
-                #   位置确认真的移走了；没移走就记警告（不阻断抛竿）。
+                #   等于没停。
+                # ★ v54：用户明确要求「每次抛竿前把鼠标移到屏幕边缘」。
+                #   改为 park_cursor_verified()：移到边缘后回读校验，不在边缘
+                #   就换边角重试（右下→右上→左下→左上），并把实际落点写进日志，
+                #   便于事后核对「鼠标到底有没有移开」。
                 try:
-                    self.wow_process.park_cursor()
-                    if hasattr(self.wow_process, "cursor_is_parked") \
-                            and not self.wow_process.cursor_is_parked():
-                        self.log("⚠️ 光标未停靠到角落（可能被游戏独占/锁定），本竿检测可能受光标干扰")
+                    if hasattr(self.wow_process, "park_cursor_verified"):
+                        ok, pos = self.wow_process.park_cursor_verified()
+                        if ok:
+                            self.log("鼠标已移到屏幕边缘: (%d,%d)", pos[0], pos[1])
+                        else:
+                            self.log("⚠️ 鼠标未能移到屏幕边缘（回读落点 %d,%d），"
+                                     "本竿检测可能受光标干扰", pos[0], pos[1])
+                    else:
+                        self.wow_process.park_cursor()
                 except Exception as _pe:
-                    self.log("⚠️ 光标停靠失败: %s", _pe)
+                    self.log("⚠️ 鼠标停靠失败: %s", _pe)
                 self._press_ten_min_key_if_due()
                 self.fishing_event_handler({"Action": "Cast"})
                 # v20：抛竿前抓 pre（此刻画面里还没有浮标），抛竿后 2 秒

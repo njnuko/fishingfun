@@ -183,6 +183,20 @@ class SearchBobberFinder:
         # ★ v50：本帧被指纹否决的最佳候选 (bw, bh, size)，供标定期把
         #   「候选存在但被判据否决」和「画面里真的没有候选」区分开。
         self._last_fp_rejected = None
+        # ★ v53：清掉上一竿的差分标定结果。
+        #   真机证据（2026-11-02 10:48:36，v53 首竿标定）：
+        #     「标定: 定位异常 '<' not supported between instances of 'int' and 'tuple'」
+        #   原因：_calib_result 是**上一竿**留下的一份字典（差分标定成功才写），
+        #   本竿走的是逐帧颜色搜索、根本没更新它。sinkcalib 却仍拿它取 area：
+        #     res.get("area", 0) → 那份字典里没有 area 键 → 0
+        #     → 退到 self.finder._last_count → 而 _last_count 全项目无人赋值
+        #     → getattr 拿到 None 走 else 分支? 不，真值路径里是个 tuple
+        #   最后 int(元组) 抛 TypeError，被 except 吞成一行「定位异常」，
+        #   这一帧的 y 就成了 None —— 标定 16/17 帧里丢的那 1 帧就是它。
+        #   跨竿残留一律在 reset() 清掉，本竿没做差分标定就不该有结果。
+        self._calib_result = None
+        self._last_count = None
+        self._last_detect_note = ""
 
     # 逐行对应 SearchBobberFinder.cs:34-57
     def find(self, bitmap=None):
@@ -577,32 +591,45 @@ class SearchBobberFinder:
             #     宽 ±60% / 高 ±25% / 面积 ±35%，两维通过即放行。
             #   顶部横带那个反例依然被拦：1969/360 = 5.5x 面积✗，
             #   宽高比 5.5 也远超大横条形态 → 宽✗ 高✗，只剩面积一票 → 否决。
+            # ★ v54 核心修复：指纹不再做「硬否决」，只做「加分排序」。
+            #   真机证据（debug.zip c002_重抛_..._找锚点失败.bmp）：
+            #     第1竿标定指纹 = 26x18 area=377
+            #     第2竿真浮标实测 = 18x10 area=148 fill=0.82（暖色掩膜干净命中）
+            #   宽✗(0.69x) 高✗(0.56x) 面积✗(0.39x) → 三维零票 → 每帧 continue，
+            #   连续 85 帧「色差检未命中」，直接超时重抛。
+            #   ★ 根因是设计错误：浮标落点每竿随机，与镜头距离也随机，
+            #   尺寸本来就会从 26x18 变到 18x10。跨竿尺寸不可作为否决依据。
+            #   现在改为：符合指纹的候选 +1 分参与排序，不符合的仍可当选；
+            #   只在「本帧候选数 > 1」时才用指纹决胜。单候选（真机绝大多数帧）
+            #   直接放行 —— 因为暖色掩膜本身已经把鱼线/反光滤干净了。
             fp = getattr(self, "bobber_fingerprint", None)
+            bonus = 0
             if fp and fp.get("frames", 0) >= 5:
                 fw, fh, fa = fp.get("w") or 0, fp.get("h") or 0, fp.get("area") or 0
-                votes = 0
                 if fw > 0 and 0.4 * fw <= bw <= 1.6 * fw:
-                    votes += 1
+                    bonus += 1
                 if fh > 0 and 0.75 * fh <= bh <= 1.25 * fh:
-                    votes += 1
+                    bonus += 1
                 if fa > 0 and 0.65 * fa <= size <= 1.35 * fa:
-                    votes += 1
-                if (fw or fh or fa) and votes < 2:
+                    bonus += 1
+                if (fw or fh or fa) and bonus == 0:
+                    # 三维一票没有：不否决，只标记（供日志统计「尺寸偏离」）
                     n_fp_rej += 1
-                    self._last_fp_rejected = (bw, bh, int(size))   # ★ v50：供标定期区分「否决」和「离场」
-                    continue                  # 三维里不够两票 → 否决
+                    self._last_fp_rejected = (bw, bh, int(size))
             n_ok += 1
-            if best is None or size > best[0]:
-                best = (size, cx, cy, bw, bh)
+            # 排序键：指纹吻合优先，其次面积大
+            score = size * (1.0 + 0.25 * bonus)
+            if best is None or score > best[0]:
+                best = (score, cx, cy, bw, bh)
         # v36：把本帧候选统计记下来，供日志/离线核对
         try:
             self._last_detect_note = (
                 "候选=%d 最佳=%s%s" % (
                     n_ok,
                     "-" if best is None else
-                    "%dx%d size=%d @(%d,%d)" % (best[3], best[4],
-                                                best[0], best[1], best[2]),
-                    (" 指纹否决%d" % n_fp_rej) if n_fp_rej else ""))
+                "%dx%d size=%d @(%d,%d)" % (best[3], best[4],
+                                            int(best[0]), best[1], best[2]),
+                    (" 尺寸偏离%d(不否决)" % n_fp_rej) if n_fp_rej else ""))
         except Exception:
             pass
         if best is None:

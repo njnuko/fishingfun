@@ -121,8 +121,13 @@ class SinkCalibrator:
                     pass
                 y = py - off_y
                 res = getattr(self.finder, "_calib_result", None)
-                if res:
-                    area = int(res.get("area", 0))
+                # ★ v53：res 必须是 dict，且真带 area；残留/异常类型一律忽略。
+                #   真机证据见 searchbobberfinder.reset() 里 v53 那条注释。
+                if isinstance(res, dict):
+                    try:
+                        area = int(res.get("area", 0) or 0)
+                    except (TypeError, ValueError):
+                        area = 0
                 if not area:
                     # 从检测明细 "候选=1 最佳=30x25 size=523 @(683,309)" 提取
                     note = getattr(self.finder, "_last_detect_note", "") or ""
@@ -130,8 +135,13 @@ class SinkCalibrator:
                     if mt:
                         area = int(mt.group(1))
                 if not area:
+                    # ★ v53：最后兜底只认数字，_last_count 全项目没人赋值、
+                    #   历史上还会是元组，int(元组) 直接 TypeError。
                     cnt = getattr(self.finder, "_last_count", None)
-                    area = int(cnt) if cnt else 0
+                    try:
+                        area = int(cnt) if cnt is not None else 0
+                    except (TypeError, ValueError):
+                        area = 0
             # v36：记录这一帧的检测明细（尺寸 + 候选数），用于离线核对
             self._last_detect = getattr(self.finder, "_last_detect_note", "-")
         except Exception as e:
