@@ -202,6 +202,11 @@ class WowProcess:
         time.sleep(self.LootDelay / 2000.0)       # ⑥ LootDelay / 2
 
     @staticmethod
+    def get_cursor_pos():
+        """★ v61：暴露模块级 get_cursor_pos，供 fishbot._loot 记「移动前光标在哪」。"""
+        return get_cursor_pos()
+
+    @staticmethod
     def park_cursor():
         """把鼠标停到屏幕右下角（避开游戏画面，防止悬停提示干扰判断）。
 

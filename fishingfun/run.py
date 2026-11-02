@@ -92,6 +92,8 @@ def main():
     ap.add_argument("--save-interval", type=float, default=1.0,
                     help="判咬钩期 debug 图存档间隔秒数（默认 1.0 = 每秒一张）。"
                          "咬钩趋势出现时自动切到 0.2 秒一张，事件帧始终强制存")
+    ap.add_argument("--stop-on-lost", type=int, default=0, choices=[0, 1],
+                    help="本竿从未锁定浮标时是否退出（默认 0=不退出，自动重抛继续）")
     ap.add_argument("--keep-casts", type=int, default=20,
                     help="debug 帧图只保留最近 N 竿（默认 20 竿约 600MB），0=不限。日志不受影响")
     ap.add_argument("--diff-bobber", default="1", choices=["1", "0"],
@@ -100,8 +102,9 @@ def main():
                     help="色差阈值：R-B 超过多少算浮标暖色（默认 20；实测水面≈-23，浮标 90~255）")
     ap.add_argument("--diff-confirm", type=int, default=3,
                     help="同位置连续多少帧色差命中才确认是浮标（默认 3，用于滤掉水面反光）")
-    ap.add_argument("--no-bobber-frames", type=int, default=3,
-                    help="连续多少帧找不到浮标就停止并提示换钓点（默认 3）")
+    ap.add_argument("--no-bobber-frames", type=int, default=20,
+                    help="连续多少帧找不到浮标才算「浮标真的没了」（默认 20 帧；"
+                         "单帧≈50ms，20 帧≈1 秒，足够和鱼咬走浮标区分）")
     ap.add_argument("--log", default="INFO", help="日志级别")
     ap.add_argument("--key-mode", default="scancode",
                     choices=["scancode", "vk", "postmessage"],
@@ -231,12 +234,26 @@ def main():
             return
         log("=" * 60)
         log("⚠️  连续 %d 帧找不到浮标 —— 本竿从未锁定浮标", n)
-        log("⚠️  浮标不在视野内或与水面颜色重合，继续抛只会瞎钓。")
-        log("⚠️  请确认浮标在截屏区内、能看清，再重新启动。")
+        # ★ v61：用户明确要求「自动重抛不退出」。
+        #   原逻辑在这里永久停机（is_enabled=False），理由是"从没锁定过
+        #   说明压根没看见浮标，重抛也没用"。但实测更常见的是：
+        #   鱼在浮标落水的瞬间就咬走（飞行期漏帧）、或一帧被船挡死，
+        #   重抛一次就正常了。停机等于整晚空转，代价远大于白抛一竿。
+        #   现在默认无限重抛；确有需要退出时用 --stop-on-lost 1。
+        if getattr(bot, "stop_on_lost", False):
+            log("⚠️  浮标不在视野内或与水面颜色重合，继续抛只会瞎钓。")
+            log("⚠️  请确认浮标在截屏区内、能看清，再重新启动。")
+            log("=" * 60)
+            bot._soft_stop = False
+            bot.is_enabled = False
+            return
+        log("   按「自动重抛不退出」策略：本竿作废，%.2f 秒后重抛（不退出）",
+            getattr(bot, "soft_stop_pause", 0.35))
+        log("   若连续多竿都这样，请确认浮标在截屏区内、能看清。")
         log("=" * 60)
-        # 永久停机：从没锁定过，说明根本没看到浮标，重抛也没用。
-        bot._soft_stop = False
+        bot._soft_stop = True
         bot.is_enabled = False
+        return
 
     finder.abort_cb = _on_no_bobber
 
@@ -288,6 +305,7 @@ def main():
     bot.trace_seconds = float(args.trace_sec)
     bot.save_interval_sec = float(args.save_interval)
     bot.keep_debug_casts = int(args.keep_casts)
+    bot.stop_on_lost = bool(args.stop_on_lost)
     # ★ v55：关键节点取证默认开（--debug 1 也强制开）
     bot.forensic = (args.forensic == "1") or bot.debug_frames
     if bot.forensic:

@@ -224,6 +224,8 @@ class FishingBot:
                 # ★ v44：每竿清空标定期锚点。锚点只能用「本竿第一帧」
                 #   找到的浮标位置；沿用上一竿的坐标必然对不上（落点不同）。
                 self._calib_anchor_local = None
+                # ★ v61：每竿清空按秒轨迹采样（竿末打印成表）
+                self._cast_trace_reset()
                 self.wow_process.press_key(self.cast_key)
 
                 # 第一次抛竿后：绿条出现，此刻才量边界，量一次就永久锁定。
@@ -1849,6 +1851,7 @@ class FishingBot:
                                        boxes=self._boxes_for_zones(fb))
             except Exception as e:
                 self.log("确认图异常 %s", e)
+            self._cast_trace_report("找锚点失败")
             return
 
         self.bite_watcher.reset(bobber_position)
@@ -1988,6 +1991,22 @@ class FishingBot:
             if current is not None:
                 self.bite_watcher._last_y = int(current[1])
 
+            # ★ v61：按秒记录本竿轨迹（t / y / yDiff / 面积 / 是否检测到）。
+            #   竿结束由 _cast_trace_report() 打印成表，用来回答
+            #   「这杆 17 秒里哪一秒浮标跳了、跳多少、为什么没判中」。
+            try:
+                _ta = getattr(self.bobber_finder, "_last_area", None)
+                if _ta is None:
+                    _bk = getattr(self.bobber_finder, "_last_block", None)
+                    _ta = _bk[2] if (_bk and len(_bk) >= 3) else None
+                self._cast_trace_tick(
+                    current,
+                    current[1] if current is not None else None,
+                    getattr(self.bite_watcher, "y_diff", None),
+                    _ta)
+            except Exception:
+                pass
+
             # ★ v55：判咬钩循环按秒存图（用户要求「debug 图每秒存一次就行」）。
             #   之前这一段一帧图都不存，离线复盘时只能看到「yDiff=6 命中」这种
             #   数字，没法核对那一帧浮标到底沉了多少像素 —— 而这正是最该验的部分。
@@ -2018,6 +2037,18 @@ class FishingBot:
                         # 稳定期：只喂 y 更新水面基准，吞掉一切判定
                         if current is not None:
                             self.bite_watcher.observe(current[1])
+                        # ★ v61：稳定期也要按秒存图。原来这里 continue 掉了，
+                        #   每竿前 2 秒一张图都没有 —— 而浮标落水后的初始
+                        #   y 基准正是在这 2 秒内建立，离线复盘时无从核对。
+                        try:
+                            if (getattr(self, "debug_frames", False)
+                                    or getattr(self, "save_regions", False)):
+                                self._dump_region(
+                                    "稳定期",
+                                    bmp=getattr(self.bobber_finder, "_bmp", None),
+                                    extra="y%s" % (current[1] if current else -1))
+                        except Exception as _de:
+                            self.log("稳定期存帧异常 %s", _de)
                         if not timed_task.execute_if_due():
                             return
                         continue
@@ -2036,7 +2067,10 @@ class FishingBot:
                         if current is not None else "消失"), force=True)
                     # ★ v55：咬钩节点取证 —— 咬钩区域图(红框) + 全屏 + 咬钩特征值
                     self._forensic_bite(current, bobber_position, "y位移下沉")
+                    self._cast_bite_at = self._cast_elapsed()
                     self._loot(bobber_position)     # ← 传抛竿位置，不是 current
+                    self._cast_trace_report("y位移下沉 %.0fpx" % (
+                        abs(getattr(self.bite_watcher, "y_diff", 0) or 0)))
                     self._press_ten_min_key_if_due()
                     return
                 # ★ v49：浮标丢了，但本次是「面积渐进缩小」丢的 → 这就是咬钩。
@@ -2051,9 +2085,16 @@ class FishingBot:
                         self.log("面积衰减判定异常 %s", e)
                         decayed = False
                     if decayed:
+                        self._cast_bite_at = self._cast_elapsed()
                         self._bite_from_decay(bobber_position)
+                        if not getattr(self, "_bite_handled_this_cast", False):
+                            self._cast_trace_report("面积衰减被17秒门控否决")
                         return
                 if current is not None and current[0] == 0:
+                    self._cast_trace_report("检测返回(0,0)，本竿结束")
+                    return
+                if current is None and getattr(self, "_anchor_locked_this_cast", False):
+                    self._cast_trace_report("浮标消失，面积无渐进衰减证据")
                     return
             else:
                 # 原版逻辑：找不到浮标直接放弃本竿
@@ -2071,7 +2112,9 @@ class FishingBot:
                         "%d_%d" % (current[0], current[1])
                         if current is not None else "消失"), force=True)
                     self._forensic_bite(current, bobber_position, "y位移下沉(legacy)")
+                    self._cast_bite_at = self._cast_elapsed()
                     self._loot(bobber_position)     # ← 传抛竿位置，不是 current
+                    self._cast_trace_report("y位移下沉(legacy)")
                     self._press_ten_min_key_if_due()
                     return
 
@@ -2136,6 +2179,90 @@ class FishingBot:
         # 「目标消失 → 重抛」；这里只标记本竿收尾，主循环正常进下一竿。
         self._bite_handled_this_cast = True
 
+    def _cast_elapsed(self):
+        """★ v61：距本竿抛竿的秒数（轨迹采样用）。未抛竿返回 None。"""
+        t = getattr(self, "_last_cast_t", None)
+        if not t:
+            return None
+        try:
+            return time.monotonic() - t
+        except Exception:
+            return None
+
+    def _cast_trace_reset(self):
+        """★ v61：每竿开始时清空轨迹采样。"""
+        self._cast_trace = []          # [(t, y, y_diff, area, found)]
+        self._cast_trace_next = 1.0    # 下一次采样时刻（距抛竿秒）
+        self._cast_bite_at = None      # 本竿判定咬钩的时刻（距抛竿秒）
+        self._cast_end_reason = None   # 本竿结束原因
+
+    def _cast_trace_tick(self, current, y, y_diff, area):
+        """★ v61：判咬钩循环里每帧调用，按 1 秒粒度记录本竿轨迹。
+
+        为什么要这个：用户要求「如果没抓到，要能看到这杆 17 秒到底哪秒
+        浮标有跳动、幅度多少、为什么没抓到」。逐帧日志有上万行，人眼
+        翻不出来；这里单独存一条按秒对齐的轨迹，竿结束一次性打印成表，
+        哪一秒 y 动了多少、当时阈值多少，一眼就能看出漏判在哪。
+        """
+        t = self._cast_elapsed()
+        if t is None:
+            return
+        if t < getattr(self, "_cast_trace_next", 1.0):
+            return
+        self._cast_trace_next = t + 1.0
+        trace = getattr(self, "_cast_trace", None)
+        if trace is None:
+            self._cast_trace = trace = []
+        if len(trace) >= 64:
+            return
+        trace.append((round(t, 1),
+                      None if y is None else int(y),
+                      None if y_diff is None else int(round(float(y_diff))),
+                      None if area is None else int(area),
+                      current is not None))
+
+    def _cast_trace_report(self, reason):
+        """★ v61：本竿结束，打印「第几秒 y 是多少、动了多少」的摘要表。"""
+        self._cast_end_reason = reason
+        trace = getattr(self, "_cast_trace", None) or []
+        bite_at = getattr(self, "_cast_bite_at", None)
+        self.log("─" * 68)
+        if bite_at is not None:
+            self.log("本竿汇总 c%03d: ✅ 第 %.1f 秒判定咬钩（%s）",
+                     self._cast_no, bite_at, reason)
+        else:
+            self.log("本竿汇总 c%03d: ❌ 未判咬钩（%s）→ 下面表格看哪一秒该判却没判",
+                     self._cast_no, reason)
+        if not trace:
+            self.log("   （本竿无轨迹采样 —— 可能锚点未锁定就结束了）")
+            self.log("─" * 68)
+            return
+        strike = getattr(self.bite_watcher, "strike_value", None)
+        base_y = getattr(self.bite_watcher, "per_cast_anchor_y", None)
+        self.log("   锚点y=%s  阈值strike=%s  （Δ=相对锚点的下沉像素，|Δ|≥阈值应判咬钩）",
+                 base_y, strike)
+        self.log("   %-7s %-7s %-7s %-8s %-8s %s",
+                 "t(s)", "y", "yDiff", "面积", "检测", "Δ")
+        peak = None
+        for (t, y, yd, area, found) in trace:
+            d = None
+            if y is not None and base_y is not None:
+                d = y - int(base_y)
+                if peak is None or abs(d) > abs(peak[1]):
+                    peak = (t, d)
+            self.log("   %-7.1f %-7s %-7s %-8s %-8s %s",
+                     t, "-" if y is None else y,
+                     "-" if yd is None else yd,
+                     "-" if area is None else area,
+                     "有" if found else "无",
+                     "-" if d is None else "%+d" % d)
+        if peak is not None and strike is not None:
+            self.log("   本竿最大位移: 第 %.1f 秒 Δ=%+d px（阈值 %s）→ %s",
+                     peak[0], peak[1], strike,
+                     "超过阈值却未判中，需排查门限/连续帧"
+                     if abs(peak[1]) >= float(strike) else "全程未达阈值")
+        self.log("─" * 68)
+
     def _loot(self, bobber_position):
         # 收竿前先拍一张「基准」：如果这行字本来就还挂在屏幕上（上一竿残留），
         # 之后就不能把它当成这一竿的结果。
@@ -2164,7 +2291,23 @@ class FishingBot:
                 pre_hit = False
 
         self.log("Right clicking mouse to Loot @ %s", bobber_position)
+        # ★ v61：用户要求「鼠标移动到锚点位置的日志 + 右键点击拾取的日志要保存」。
+        #   原来只有 wowprocess 内部一行落点校验日志，缺少
+        #   「从哪里移到哪里 / 什么时候按下 / 什么时候抬起」的打点，
+        #   事后无法确认右键到底有没有真的发出去。
+        try:
+            _cur = self.wow_process.get_cursor_pos()
+            self.log("拾取①鼠标移动: 从 (%d,%d) → 锚点屏幕 (%d,%d) | 局部 %s",
+                     _cur[0], _cur[1], bobber_position[0], bobber_position[1],
+                     self._to_local(bobber_position))
+        except Exception as e:
+            self.log("拾取①鼠标移动: 目标屏幕 (%d,%d)（读原光标失败 %s）",
+                     bobber_position[0], bobber_position[1], e)
+        _t_click0 = time.monotonic()
         self.wow_process.right_click_mouse(bobber_position)
+        self.log("拾取②右键已发送: 屏幕 (%d,%d) 耗时 %.0fms",
+                 bobber_position[0], bobber_position[1],
+                 (time.monotonic() - _t_click0) * 1000.0)
         # 非原版调试：拾取动作做完立刻存「拾取后」帧（含聊天框物品提示）
         self._dump_dbg("post", bobber_position, None)
         # 非原版：判收竿结果 —— 屏幕上方弹出「没有鱼上钩」= 时机不对，其实没鱼
