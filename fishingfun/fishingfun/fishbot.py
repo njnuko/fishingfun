@@ -10,7 +10,8 @@
         (b) 咬钩后浮标沉入水下   → **是咬钩**，必须立刻右键拾取。
       两者的区别靠「距抛竿过了多久」+「消失前有没有晃动」来区分。
   ⇒ 所以任何「找不到浮标就判咬钩」的写法都是错的，必须结合时间与
-    消失前的形变证据。参见 _wait_for_bite 顶部说明与 area_decayed()。
+    消失前的形变证据。参见 _wait_for_bite 顶部说明。
+    ★ v62：已彻底删除 area_decayed() 判据 —— 浮标消失 ≠ 咬钩。
 ════════════════════════════════════════════════════════════════════
 
 关键点（一个都不能省，省了就「只抛竿不拾取」）：
@@ -848,10 +849,8 @@ class FishingBot:
             feats["本竿锚点y"] = ay
             if current is not None:
                 feats["实际下沉px"] = int(ay - current[1])
-        try:
-            feats["面积衰减"] = self.bobber_finder.area_decayed()
-        except Exception:
-            pass
+        # ★ v62：不再记录「面积衰减」。它不是咬钩证据（见 MECHANISM.md 代码禁区），
+        #   留着只会让人误以为它参与过判定、下次又照着它加逻辑。
         yp = getattr(bw, "y_positions", None)
         if yp:
             feats["最近y序列"] = [int(v) for v in list(yp)[-12:]]
@@ -1890,14 +1889,12 @@ class FishingBot:
         # 非原版：锚点可信度检查。若 2 秒跟踪期命中帧占比过低（<45%），
         # ★ v41：走到这里说明本竿已经拿到锚点位置，标记下来供停机文案判断。
         self._anchor_locked_this_cast = True
-        # ★ v59：注册「abort 前衰减裁决」回调。
-        #   浮标消失到撞上 no_bobber_limit 只有 3 帧（≈150ms），
-        #   _wait_for_bite 主循环里的 area_decayed() 分支永远等不到那一帧；
-        #   必须由 find() 在 abort 之前回调进来，这里就地完成拾取。
-        #   只会被调一次（finder 侧 _decay_claimed 每竿清零）。
-        def _on_decay_bite(_pos=(bobber_position[0], bobber_position[1])):
-            self._bite_from_decay(_pos)
-        self.bobber_finder.decay_claim_cb = _on_decay_bite
+        # ★ v62：不再注册 decay_claim_cb。
+        #   v59~v61 这里挂过一个「abort 前把面积衰减判成咬钩」的回调，
+        #   前提是「鱼会把浮标拉入水下」—— 这个前提不存在（用户第三次纠正）：
+        #   只有咬钩（浮标晃动）和 17 秒到期自动收杆两种事件。
+        #   浮标消失永远只是收杆，绝不能据此右键。见 MECHANISM.md「代码禁区」。
+        self.bobber_finder.decay_claim_cb = None
         # 说明真鱼鳔大部分帧检测不到，锚点很可能是旁边别的米黄物体，
         # 整个 25 秒都会拿它当基准 → 满屏误判。直接放弃本竿重抛。
         track = getattr(self, "_last_track", None)
@@ -2073,28 +2070,15 @@ class FishingBot:
                         abs(getattr(self.bite_watcher, "y_diff", 0) or 0)))
                     self._press_ten_min_key_if_due()
                     return
-                # ★ v49：浮标丢了，但本次是「面积渐进缩小」丢的 → 这就是咬钩。
-                #   v48 以前只看 y 位移，浮标面积从 457 缩到 313 再消失这种
-                #   曲线被当成「目标消失 → 重抛」，白白放跑一条鱼。
-                #   注意只在本竿锚点已锁定、且当前帧确实没找到时判，
-                #   避免和上面 y 位移判定重复。
-                if current is None and getattr(self, "_anchor_locked_this_cast", False):
-                    try:
-                        decayed = self.bobber_finder.area_decayed()
-                    except Exception as e:
-                        self.log("面积衰减判定异常 %s", e)
-                        decayed = False
-                    if decayed:
-                        self._cast_bite_at = self._cast_elapsed()
-                        self._bite_from_decay(bobber_position)
-                        if not getattr(self, "_bite_handled_this_cast", False):
-                            self._cast_trace_report("面积衰减被17秒门控否决")
-                        return
+                # ★ v62：删掉「面积渐进缩小 → 判咬钩」这一段（v49 起的老逻辑）。
+                #   用户明确纠正：不存在鱼拉走浮标，浮标消失永远是 17 秒到期
+                #   自动收杆。面积收缩只是收杆动画，拿它判咬钩 = 朝空气右键。
+                #   咬钩的唯一信号是晃动（上面的 y 位移判定）。
                 if current is not None and current[0] == 0:
                     self._cast_trace_report("检测返回(0,0)，本竿结束")
                     return
                 if current is None and getattr(self, "_anchor_locked_this_cast", False):
-                    self._cast_trace_report("浮标消失，面积无渐进衰减证据")
+                    self._cast_trace_report("浮标消失（17秒到期自动收杆，非咬钩）")
                     return
             else:
                 # 原版逻辑：找不到浮标直接放弃本竿
@@ -2137,47 +2121,21 @@ class FishingBot:
 
     # ---- 逐行对应 FishBot.cs:164-168 ----
     def _bite_from_decay(self, bobber_position):
-        """★ v59：面积渐进衰减式咬钩的统一处理（主循环分支 + abort 前回调共用）。
+        """★ v62：**已废弃，改成空操作**。
 
-        真机依据见 searchbobberfinder.area_decayed() 与 _claim_decay()。
-        两条触发路径：
-          ① _wait_for_bite 主循环 current is None 时（旧路径，很少能轮到）
-          ② find() 即将 abort 前的 decay_claim_cb（新路径，实测走这条）
+        ⚠️ 用户明确纠正：不存在「鱼把浮标拉走」这回事。游戏里只有
+          ① 浮标晃动 = 唯一咬钩信号 → 右键拾取
+          ② 17 秒到 = 自动收杆、浮标消失 → 重抛，绝不右键
 
-        ★ v60：17 秒门控在这里统一实施，两条路径都绕不过去。
-          否则主循环那条路径会在 17 秒到期收杆时照样右键空气。
+        v49 引入、v59/v60 加固的「面积渐进缩小 = 鱼在拉 = 咬钩」整条逻辑
+        前提不成立 —— 那段面积收缩是到期收杆的固定动画（第1、2竿逐帧一致
+        …195,112,158,97,80,70），按它判定就是朝空气右键。
+
+        保留空壳只为兼容旧调用点；**不要在这里恢复判定逻辑**。
         """
-        # ── 17 秒存活期门控（见 FISHING_MECHANISMS.md 第 1 节）──
-        _el = None
-        try:
-            _f = getattr(self.bobber_finder, "seconds_since_cast", None)
-            if callable(_f):
-                _el = float(_f())
-        except Exception:
-            _el = None
-        _dl = float(getattr(self.bobber_finder, "bite_deadline_s", 16.5))
-        if _el is not None and _el >= _dl:
-            self.log("面积衰减发生在抛竿后 %.1fs（≥%.1fs 浮标存活期）→ "
-                     "判为 17 秒到期自动收杆，不拾取", _el, _dl)
-            return
-        if getattr(self, "_bite_handled_this_cast", False):
-            return
-        self.log("咬钩判定: 浮标面积渐进缩小至消失（抛竿后 %s）→ 判为咬钩",
-                 "%.1fs" % _el if _el is not None else "未知")
-        try:
-            self._dump_region("咬钩衰减", extra="锚点%d_%d" % (
-                bobber_position[0], bobber_position[1]))
-        except Exception as e:
-            self.log("衰减咬钩存图失败: %s", e)
-        try:
-            self._forensic_bite(None, bobber_position, "面积渐进衰减")
-        except Exception as e:
-            self.log("衰减咬钩取证失败: %s", e)
-        self._loot(bobber_position)
-        self._press_ten_min_key_if_due()
-        # 本竿到此结束：finder 侧已判过衰减，abort_cb 不能再把整轮打成
-        # 「目标消失 → 重抛」；这里只标记本竿收尾，主循环正常进下一竿。
-        self._bite_handled_this_cast = True
+        self.log("（已废弃路径 _bite_from_decay 被调用，忽略：浮标消失≠咬钩）")
+        return False
+
 
     def _cast_elapsed(self):
         """★ v61：距本竿抛竿的秒数（轨迹采样用）。未抛竿返回 None。"""

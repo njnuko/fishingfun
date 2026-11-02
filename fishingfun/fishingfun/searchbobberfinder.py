@@ -224,91 +224,24 @@ class SearchBobberFinder:
         return True
 
     def _claim_decay(self):
-        """★ v60：abort 之前的裁决 —— 但**必须**结合 17 秒浮标存活期。
+        """★ v62：**已废弃，恒返回 False**。
 
-        ⚠️ v60 第一版写错过，这里记录清楚，防止再犯：
-          当时仅凭「面积渐进缩小」就判咬钩，理由是 13:46:07 第 2 竿
-          序列 271→225→219→216→211→205→201→195→112→消失 单调缩小。
-          但把三竿时间对齐后真相是：
-            第1竿 抛竿 13:45:30.542 → 消失 13:45:49.200（+18.66s）
-            第2竿 抛竿 13:45:49.660 → 消失 13:46:08.102（+18.44s）
-            第3竿 抛竿 13:46:08.557 → 咬钩 13:46:27.294（+18.74s）
-          第1、2 竿消失前面积序列**逐帧完全一致**（…195,112,158,97,80,70），
-          这是 17 秒到期、游戏自动收杆时浮标被收起的固定动画，
-          根本不是鱼在拉。若按面积判咬钩，这两竿会朝空气右键。
-          真正的区别在**形变方式**：
-            · 到期收杆 → 只有面积缩，y 坐标几乎不动（第1/2竿 y 恒定）
-            · 鱼咬钩   → **y 位移**（第3竿 401→420→425，位移 24px）
-        所以：面积衰减不能单独作为咬钩判据。
+        ⚠️ 用户明确纠正（2026-11-02，第三次强调）：
+          「不存在鱼拉走浮标。只有咬钩，即浮标晃动。
+            如果你没检测出浮标晃动（咬钩），17 秒后浮标会自动消失。」
 
-        现在本函数只在「距抛竿 < 到期余量」且面积衰减成立时才认咬钩，
-        其余一律放行给 abort（= 本竿正常结束、重抛）。
-        返回 True = 上层已按咬钩处理；False = 正常走 abort。
+        所以游戏里只有两种事件：
+          · 晃动（y 位移）→ 唯一的咬钩信号 → 右键拾取
+          · 17 秒到 → 自动收杆，浮标消失，与鱼无关 → 重抛，绝不右键
+
+        v49~v61 曾把「浮标消失前面积渐进缩小」当作"鱼把浮标拉入水下"，
+        v60 还给它加了 16.5 秒时间门控 —— 整条推理链的前提（鱼能拉走浮标）
+        根本不存在。那段面积收缩只是到期收杆的固定动画（第1、2竿逐帧一致：
+        …195,112,158,97,80,70），若按其判定就会朝空气右键。
+
+        保留空壳只为兼容旧调用点/测试；不要在这里恢复任何判定逻辑。
         """
-        cb = getattr(self, "decay_claim_cb", None)
-        if cb is None:
-            return False
-        # ★ 17 秒门控：距抛竿不足 N 秒的消失才可能是咬钩；
-        #   过了这个点，浮标消失基本都是到期自动收杆。
-        el = None
-        elapsed = getattr(self, "seconds_since_cast", None)
-        if callable(elapsed):
-            try:
-                el = float(elapsed())
-            except Exception:
-                el = None
-        deadline = float(getattr(self, "bite_deadline_s", 16.5))
-        if el is not None and el >= deadline:
-            self.log("浮标消失于抛竿后 %.1fs（≥%.1fs 浮标存活期）→ "
-                     "判为 17 秒到期自动收杆，不是咬钩，不拾取",
-                     el, deadline)
-            return False
-        try:
-            decayed = self.area_decayed()
-        except Exception as e:
-            self.log("衰减裁决异常: %s", e)
-            return False
-        if not decayed or getattr(self, "_decay_claimed", False):
-            return False
-        self._decay_claimed = True
-        self.log("★ abort 前裁决：%s 处面积渐进缩小至消失 → 判为咬钩（未到期）",
-                 ("%.1fs" % el) if el is not None else "未知时刻")
-        try:
-            cb()
-        except Exception as e:
-            self.log("衰减裁决回调异常: %s", e)
-        return True
-
-    def reset(self):
-        self.previous_location = None
-        self._area_hist = []      # 非原版：本竿面积历史，用于尺寸跳变判定
-        self._decay_claimed = False
-        # ★ v49：重抛后必须把「连续找不到浮标」的计数清零。
-        #   原来 reset() 没清，上一竿凑满 3 帧触发停机后计数器仍是 3，
-        #   新一竿第一帧再 miss 一次就立刻又到 3（no_bobber_limit=3），
-        #   等于重抛之后必然再次秒停 —— 「重抛继续」形同虚设。
-        self.no_bobber_frames = 0
-        # v37：每竿重置色差锚点，避免上一竿的浮标位置影响本竿
-        self._diff_anchor = None
-        self._diff_hits = 0
-        self._diff_prev = None
-        # ★ v50：本帧被指纹否决的最佳候选 (bw, bh, size)，供标定期把
-        #   「候选存在但被判据否决」和「画面里真的没有候选」区分开。
-        self._last_fp_rejected = None
-        # ★ v53：清掉上一竿的差分标定结果。
-        #   真机证据（2026-11-02 10:48:36，v53 首竿标定）：
-        #     「标定: 定位异常 '<' not supported between instances of 'int' and 'tuple'」
-        #   原因：_calib_result 是**上一竿**留下的一份字典（差分标定成功才写），
-        #   本竿走的是逐帧颜色搜索、根本没更新它。sinkcalib 却仍拿它取 area：
-        #     res.get("area", 0) → 那份字典里没有 area 键 → 0
-        #     → 退到 self.finder._last_count → 而 _last_count 全项目无人赋值
-        #     → getattr 拿到 None 走 else 分支? 不，真值路径里是个 tuple
-        #   最后 int(元组) 抛 TypeError，被 except 吞成一行「定位异常」，
-        #   这一帧的 y 就成了 None —— 标定 16/17 帧里丢的那 1 帧就是它。
-        #   跨竿残留一律在 reset() 清掉，本竿没做差分标定就不该有结果。
-        self._calib_result = None
-        self._last_count = None
-        self._last_detect_note = ""
+        return False
 
     # 逐行对应 SearchBobberFinder.cs:34-57
     def find(self, bitmap=None):
@@ -374,8 +307,8 @@ class SearchBobberFinder:
                          self.no_bobber_frames, self.no_bobber_limit)
                 if (self.abort_cb is not None
                         and self.no_bobber_frames >= self.no_bobber_limit):
-                    if self._claim_decay():
-                        return None
+                    # ★ v62：不再调 _claim_decay 把「浮标消失」当咬钩——
+                    #   浮标消失永远只是 17 秒到期自动收杆，与鱼无关。
                     self.abort_cb(self.no_bobber_frames)
                 return None
 
@@ -423,8 +356,7 @@ class SearchBobberFinder:
             self.log("暖色像素为 0，判本帧无浮标（不放行 TAN 兜底）")
             if (self.abort_cb is not None
                     and self.no_bobber_frames >= self.no_bobber_limit):
-                if self._claim_decay():
-                    return None
+                # ★ v62：同上，浮标消失≠咬钩。
                 self.abort_cb(self.no_bobber_frames)
             return None
 
