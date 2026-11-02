@@ -294,6 +294,18 @@ def main():
 
     wow.press_key(0x20)          # Program.cs:33 先按空格（开局/停马）
     time.sleep(1.5)
+    # ★ v52：启动后、第一竿之前就把光标挪到屏幕右下角。
+    #   用户实测：第一竿抛出去之前光标还停在画面中间，会挡住浮标/出悬停提示，
+    #   污染首竿标定（首竿标定决定指纹和 strike_value，最贵）。
+    #   这里显式做一次并回读校验，不依赖 bot.start() 里的每竿停靠。
+    try:
+        wow.park_cursor()
+        if hasattr(wow, "cursor_is_parked"):
+            log("鼠标停靠: %s", "✅ 已移到右下角" if wow.cursor_is_parked()
+                else "⚠️ 未能移动（可能被游戏独占/锁定）")
+    except Exception as e:
+        log("鼠标停靠失败: %s", e)
+
     try:
         bot.start()
     except KeyboardInterrupt:

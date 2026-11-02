@@ -134,11 +134,16 @@ class FishingBot:
                 self.log("Pressing key %s to Cast.", self.cast_key)
                 # 非原版：抛竿前先把光标停到屏幕右下角，避免鼠标悬停在抛竿点附近
                 # 挡住浮标 / 弹出悬停提示干扰 tan 判定
+                # ★ v52：park_cursor 以前是坏方法（漏 self）又被 except 吞掉，
+                #   等于没停。现在挪到 press_key 之前、抛竿前先移开，并回读光标
+                #   位置确认真的移走了；没移走就记警告（不阻断抛竿）。
                 try:
-                    if hasattr(self.wow_process, "park_cursor"):
-                        self.wow_process.park_cursor()
-                except Exception:
-                    pass
+                    self.wow_process.park_cursor()
+                    if hasattr(self.wow_process, "cursor_is_parked") \
+                            and not self.wow_process.cursor_is_parked():
+                        self.log("⚠️ 光标未停靠到角落（可能被游戏独占/锁定），本竿检测可能受光标干扰")
+                except Exception as _pe:
+                    self.log("⚠️ 光标停靠失败: %s", _pe)
                 self._press_ten_min_key_if_due()
                 self.fishing_event_handler({"Action": "Cast"})
                 # v20：抛竿前抓 pre（此刻画面里还没有浮标），抛竿后 2 秒
@@ -177,21 +182,20 @@ class FishingBot:
                 #   → 重抛 → 停机。用户看到的就是「钓一竿就停」。
                 #   现在把 _watch 的末位置带过去，标定结束后直接用它当锚点，
                 #   根本不用再找一次。
+                # ★ v51：把「跟踪期锚点保留」整段删掉。
+                #   真机日志 2026-11-02 09:52:16~09:52:17 的现场证据：
+                #     09:52:16,127 跟踪期锚点保留: (752, 283)   ← _watch 打的稳定位
+                #     09:52:16,453 三帧确认通过 → 本竿锚点 屏幕 (763, 285)
+                #     09:52:17,129 复用跟踪期锚点失败 '<' not supported
+                #                  between instances of 'tuple' and 'int'
+                #   两个问题叠在一起：
+                #     ① 「追踪稳定位」日志打的位置和真正写进 _tracked_anchor 的
+                #        变量不是同一个数（752 vs 763，差 11px），日志与实际不符；
+                #     ② 复用路径做坐标换算后再比较，类型一不对就抛异常，整条
+                #        捷径白跑，每竿白花 0.7~1.5 秒，最后还是退回现场找锚点。
+                #   更根本的是用户反复强调的铁律：每竿锚点必须现场重新判定，
+                #   绝不搬运上一阶段/上一竿的坐标。所以这里彻底不再保留。
                 self._tracked_anchor = None
-                try:
-                    # ★ v42：用 _watch 算出的「稳定位众数」，不用 last。
-                    #   last 可能被追踪尾声的假目标污染（实测 (1184,622)）。
-                    _pos = getattr(self, "_last_track_stable", None)
-                    _frames, _hits = getattr(self, "_last_track", (0, 0))
-                    # 命中率够高才可信（实测 31/39=79%，门槛取 45%）
-                    if (_pos is not None and _frames >= 8
-                            and _hits / float(_frames) >= 0.45):
-                        self._tracked_anchor = _pos
-                        self.log("跟踪期锚点保留: %s（命中 %d/%d 帧，标定后直接复用）",
-                                 _pos, _hits, _frames)
-                except Exception as _e:
-                    self.log("跟踪期锚点保留失败 %s", _e)
-                    self._tracked_anchor = None
 
                 # v21：第一竿抛竿后采 17 秒，实测本钓点浮标下沉幅度，
                 # 反推 strike_value。只做一次，之后所有竿沿用。
@@ -912,6 +916,12 @@ class FishingBot:
         self._trace_next = 0.0      # ★ v45：逐秒采样下一次触发时刻（相对 start）
         frames = hits = 0
         last = None
+        # ★ v52：可信度分母只统计「浮标确实该在画面里」的帧。
+        #   真机日志（09:56 第 2 竿）：锚点可信度 2/40 帧 = 5% → 放弃重抛。
+        #   那 40 帧里有 1.8 秒飞行期（浮标还在空中）+ 前面等待黄色浮标的时段
+        #   （浮标刚落水还没稳定），这些帧「找不到浮标」是物理必然，
+        #   拿去当分母等于自罚。这里从「第一次命中」开始计帧。
+        frames_inview = 0
         positions = []          # ★ v42：记录每次命中位置，用于取众数
         _blocks = []            # ★ v43：(pos, (area,w,h)) 用于首竿建浮标指纹
         last_bmp = None
@@ -925,6 +935,9 @@ class FishingBot:
             while (time.monotonic() - start) * 1000.0 < milliseconds:
                 pos = self.bobber_finder.find()
                 frames += 1
+                # ★ v52：浮标第一次出现之后，每一帧都算「应该在画面里」
+                if positions:
+                    frames_inview += 1
                 # v20：留存本次抓到的原始帧，循环结束时它就是 post
                 last_bmp = getattr(self.bobber_finder, "_bmp", None)
                 # v22：这一帧里已经能看见黄浮标 → 它就是合格的 post
@@ -1039,15 +1052,25 @@ class FishingBot:
             need = max(5, int(len(positions) * 0.45))
             if cnt >= need and span <= 60:
                 stable = (int(sum(xs) / float(cnt)), int(sum(ys) / float(cnt)))
-                self.log("追踪稳定位: %s（最大簇 %d/%d 帧，需≥%d，跨度 %dpx）%s",
-                         stable, cnt, len(positions), need, span,
-                         "" if stable == last else " → 覆盖末位置 %s" % (last,))
+                self.log("追踪稳定位(局部): %s（最大簇 %d/%d 帧，需≥%d，跨度 %dpx）",
+                         (int(stable[0]), int(stable[1])),
+                         cnt, len(positions), need, span)
             else:
                 self.log("追踪位不稳: 最大簇 %d/%d 帧（需≥%d），跨度 %dpx（需≤60）"
                          " → 不提供跟踪期锚点",
                          cnt, len(positions), need, span)
-        self._last_track = (frames, hits)     # 供 _wait_for_bite 判锚点可信度
-        self._last_track_stable = stable      # ★ v42
+        self._last_track = (max(frames_inview, 10), hits)   # ★ v52：分母已去掉飞行期/等待期
+        #   分母再设 10 帧下限：浮标只露 1 帧就丢（1/1=100%）不能算高可信。
+        # ★ v52：坐标系铁律 —— positions 里的值就是【局部坐标】（截屏区图像内），
+        #   因为 find() 的每条返回路径都是 _to_screen(局部)，即 局部 + sa[0..1]，
+        #   而 sa 在 arm_area() 之后整竿不变、每帧用的又是同一张截屏图像。
+        #   所以这里直接存 stable，不做任何二次换算，日志也直接打局部值。
+        #   真机日志（2026-11-02 09:56，100% 缩放）证明 v51 减错了：
+        #     追踪稳定位: (646, 284) 最大簇 18/19 帧 跨度 0px
+        #     锚点校验: 局部 (286,123) 高对比亮团 4px → 拒绝
+        #     （截屏区 720x382@360,161 → 646-360=286，284-161=123）
+        #   646/284 减完落到左上角一片死水，校验当然只有 4px 亮团。
+        self._last_track_stable = stable
         # ★ v43：首竿建「浮标指纹」。只取落在稳定簇内的块 —— 那些才是
         #   通过聚类校验的真浮标帧，边缘散点（水面反光）不参与。
         if stable is not None and _blocks and \
@@ -1066,6 +1089,31 @@ class FishingBot:
         self.bobber_finder.suppress_abort = False
         self.bobber_finder.no_bobber_frames = 0
 
+        # ★ v51：把「跟踪期稳定位」作为【本竿候选】交给找锚点阶段。
+        #   真机日志（2026-11-02 09:52:08~09:52:13 第 2 竿）暴露的问题：
+        #     抛竿后跟踪 2.0s: 40 帧, 命中 8 帧 → 跟丢了；
+        #     anchor_wait 3.3s 里连一帧都没定上锚点 → 重抛。
+        #   原因是 find() 每帧只有一个 previous_location（±40px 窗口），
+        #   命中率只有 20% 时，下一帧窗口就漂走了，越扫越远。
+        #   而 8 帧命中里本来就有 7 帧稳定聚在同一个点（日志：最大簇 7/8 帧）。
+        #   所以：把那个稳定簇作为「本竿候选窗口中心」写进 previous_location，
+        #   让补扫的每一帧都围绕它找 —— 命中率会从 20% 拉回高位。
+        #   注意这绝不是跨竿/跨阶段搬运：它来自「本竿抛竿后的画面」，
+        #   而且下面还要过亮团闸门 + 三帧一致性确认，验不过照样重抛。
+        _st_l = getattr(self, "_last_track_stable", None)   # v51：局部坐标
+        if _st_l is not None:
+            try:
+                self.bobber_finder.previous_location = (int(_st_l[0]), int(_st_l[1]))
+                self.log("找锚点: 用本竿跟踪稳定位 局部 %s 作为搜索窗口中心", tuple(_st_l))
+            except Exception as _e:
+                self.log("找锚点: 稳定位写入失败 %s", _e)
+                self.bobber_finder.previous_location = None
+        else:
+            try:
+                self.bobber_finder.previous_location = None
+            except Exception:
+                pass
+
         # 注意：抛竿后立刻抓一帧 BMP 会占满 IO，且此刻光标可能还在画面里，
         # 只在「找不到浮标」时才落盘（见 _wait_for_bite），平时不抓。
 
@@ -1081,84 +1129,17 @@ class FishingBot:
         #   这段期间浮标可能已经沉下去/视图变了，标定结束后再花 1.5 秒
         #   找锚点必然失败，然后误报「这个钓点太暗了」并停机。
         #   复用跟踪期锚点，等于把「找锚点」这一步彻底省掉。
-        tracked = getattr(self, "_tracked_anchor", None)
-        # ★ v46 关键改动：删除 v44「标定期锚点直接复用」的捷径。
-        #   用户已反复强调：第一竿只标定「浮标特征 + 咬钩特征」，
-        #   从第二竿起浮标落点每一竿都是随机的，必须每竿重新判定。
-        #   v44 那条捷径等于把上一竿的位置当成这一竿的答案，正是
-        #   v45 真机日志里「锚点定在空白水面 (429,350) → 每帧未命中
-        #   → 误判目标消失 → Bot has Stopped」的源头。
-        #   现在：标定阶段记录的锚点只用于「这一竿标定期的跟踪」，
-        #   一旦进入新一竿，一律走下面的现场检测，绝不跨竿搬运。
         self._calib_anchor_local = None
-        if tracked is not None:
-            # ★ v43 核心修复：坐标系错配。
-            #   _tracked_anchor 是 find() 的返回值 = 屏幕坐标（已含截屏区偏移）；
-            #   而 bobber_finder.previous_location 全程是截屏区「局部坐标」，
-            #   _find_points 直接拿它当像素窗口中心用。
-            #   v42 把屏幕坐标 (1258,767) 塞进去，截屏区只有 1280x801，
-            #   搜索窗口被推到右下角 (1218~1280, 727~801)，真浮标在局部
-            #   (618,413) 完全不在窗口内 → 连续 miss → 误判「从未锁定」停机。
-            prev_local = None
-            try:
-                g = getattr(self.bobber_finder, "grabber", None)
-                _l, _t, _cw, _ch = g.search_area()
-                _lx, _ly = int(tracked[0]) - int(_l), int(tracked[1]) - int(_t)
-                _b = g.grab()
-                _h, _w = _b.shape[0], _b.shape[1]
-                if 0 <= _lx < _w and 0 <= _ly < _h:
-                    prev_local = (_lx, _ly)
-                else:
-                    self.log("跟踪期锚点 %s → 局部 (%d,%d) 越界（截屏区 %dx%d），丢弃",
-                             tracked, _lx, _ly, _w, _h)
-            except Exception as e:
-                self.log("跟踪期锚点 %s 坐标换算失败 %s，丢弃", tracked, e)
-
-            if prev_local is not None:
-                try:
-                    # ★ v46：跨竿复用前先做暖色校验。校验不过就直接丢弃，
-                    #   不浪费一次 find()，也绝不会把「空白水面」当锚点。
-                    if not self._anchor_has_bobber(prev_local):
-                        self.log("跟踪期锚点 %s（局部 %s）暖色校验不过，丢弃"
-                                 "（该处无浮标，不允许跨竿复用）", tracked, prev_local)
-                        prev_local = None
-                except Exception as e:
-                    self.log("跟踪期锚点暖色校验异常 %s，丢弃", e)
-                    prev_local = None
-
-            if prev_local is not None:
-                try:
-                    # ★ v42：复用前先现场验一帧。标定跑了 17 秒，浮标可能已经
-                    #   被咬走/换了位置。验不到就不要硬用陈旧坐标，退回正常找锚点。
-                    self.bobber_finder.previous_location = prev_local
-                    _probe = self.bobber_finder.find()
-                    if _probe is None:
-                        self.log("跟踪期锚点 %s（局部 %s）现场验证失败（标定期间浮标已移动），退回重新找锚点",
-                                 tracked, prev_local)
-                        self.bobber_finder.previous_location = None
-                    else:
-                        # ★ v46：跟踪期锚点也只是候选，同样要三帧确认。
-                        _anchor, _info = self._confirm_anchor_3frames(
-                            _probe, max_frames=12)
-                        if _anchor is None:
-                            self.log("跟踪期锚点三帧确认失败（%s），退回重新找锚点", _info)
-                            self.bobber_finder.previous_location = None
-                            _probe = None
-                        else:
-                            _probe = _anchor
-                    if _probe is not None:
-                        self.bite_watcher.reset(_probe)
-                        self.log("浮标位置(本竿锚点): 屏幕 %s | 局部 %s（跟踪期候选+三帧确认）",
-                                 _probe, self._to_local(_probe))
-                        self._dump_region("锚定", extra="跟踪锚点%d_%d" % (
-                            _probe[0], _probe[1]))
-                        self._verify_and_watch(_probe)
-                        return
-                except Exception as e:
-                    self.log("复用跟踪期锚点失败 %s，退回重新找锚点", e)
-                    self.bobber_finder.previous_location = None
-            else:
-                self.bobber_finder.previous_location = None
+        # ★ v51：复用跟踪期锚点的整条捷径已删除（证据见 _tracked_anchor 处注释）。
+        #   以前这段会：坐标换算 → 亮团闸门校验 → find() 探针 → 再三帧确认，
+        #   实测只有一个结局 —— 抛异常或校验不过，然后照样退回下面的现场找锚点，
+        #   白花 0.7~1.5 秒（真机 09:52:16.127 → 09:52:17.129 正好 1.0 秒）。
+        #   现在直接把 previous_location 清空，让 find() 从全画面开始扫。
+        self._tracked_anchor = None
+        try:
+            self.bobber_finder.previous_location = None
+        except Exception:
+            pass
 
         # 非原版改进：找锚点阶段。抛竿后浮标要飞 0.5~1 秒才落水，落水后
         # 还有水花遮挡，这一段单帧扫不到浮标是正常的。所以不能「一帧没扫
@@ -1204,24 +1185,29 @@ class FishingBot:
             #   原来直接用差分覆盖，整竿锚点就错了。规则：
             #     · 色差已稳定锁定 → 差分只有在「同一位置」（±60px）时才采纳
             #     · 色差没锁定   → 差分可用，但 _calibrate 内部已做暖色自检
-            _color_lock = getattr(self, "_tracked_anchor", None)
+            # ★ v51：交叉校验改成用「本竿 _watch 期稳定簇」和「差分结果」比，
+            #   不再读 _tracked_anchor（v51 已彻底停用那条捷径）。
+            #   v43 的问题依然成立：真机 21:17:25 色差连中 19 帧锁定 (548,235)，
+            #   差分却返回 (388,641)（深蓝水面块），两条路差 400+ px。
+            #   所以差分也要和颜色搜索的稳定结果对齐：
+            #     · 颜色搜索本竿已稳定 → 差分只有落在同一位置（±60px）才采纳
+            #     · 颜色搜索没稳定   → 差分可用，但下面仍要过亮团闸门+三帧确认
+            _color_lock = None
+            if getattr(self, "_anchor_color_stable", False):
+                _st = getattr(self, "_last_track_stable", None)   # v51：已是局部坐标
+                if _st is not None:
+                    _color_lock = (int(_st[0]), int(_st[1]))
             try:
                 bobber_position = bf._calibrate(bf._calib_bmp)
             except Exception as e:
                 self.log("差分标定异常: %s", e)
                 bobber_position = None
-            if (bobber_position is not None and _color_lock is not None
-                    and getattr(self, "_anchor_color_stable", False)):
-                # _tracked_anchor 是屏幕坐标，差分给的是局部坐标 → 先换算再比
-                try:
-                    _g = getattr(bf, "grabber", None)
-                    _sa = _g.search_area() if _g is not None else (0, 0, 0, 0)
-                except Exception:
-                    _sa = (0, 0, 0, 0)
-                _d = max(abs(bobber_position[0] - (_color_lock[0] - _sa[0])),
-                         abs(bobber_position[1] - (_color_lock[1] - _sa[1])))
+            if bobber_position is not None and _color_lock is not None:
+                # 两边统一换算成局部坐标再比（差分本来就是局部坐标）
+                _d = max(abs(bobber_position[0] - _color_lock[0]),
+                         abs(bobber_position[1] - _color_lock[1]))
                 if _d > 60:
-                    self.log("差分标定否决: 差分 (%d,%d) 与颜色搜索稳定锚点 %s 相距 %dpx"
+                    self.log("差分标定否决: 差分 (%d,%d) 与颜色搜索稳定位置 局部 %s 相距 %dpx"
                              "（>60），不采信，改用颜色搜索",
                              bobber_position[0], bobber_position[1], _color_lock, _d)
                     bf.previous_location = None
@@ -1376,7 +1362,8 @@ class FishingBot:
             frames, hits = track
             ratio = hits / float(frames or 1)
             thresh = getattr(self, "anchor_ratio_min", 0.35)
-            self.log("锚点可信度: %d/%d 帧 = %.0f%%", hits, frames, ratio * 100)
+            self.log("锚点可信度: %d/%d 帧 = %.0f%%（分母=浮标出现后的帧数）",
+                     hits, frames, ratio * 100)
             # 诊断(v17)：输出命中率分布，用于定门槛。不改判定行为。
             self.log("DIAG可信度 n=%d hits=%d ratio=%.3f 门槛=%.2f", frames, hits, ratio, thresh)
             try:
@@ -1388,9 +1375,14 @@ class FishingBot:
             # 双峰说明"要么浮标清楚、要么基本看不见"，不存在勉强能看的过渡带；
             # 0.45 正好切在低峰中间，把 45% 的竿全拒掉造成无效重抛。
             # 降到 0.35（实测最低 0.359）等于不再误拒，同时保留极端保护。
+            # ★ v52：不再「放弃重抛」。走到这里锚点已经过三帧一致性确认
+            #   + 高对比亮团校验，是现场验过的真浮标；可信度只是个统计指标，
+            #   拿来否定已确认的锚点是本末倒置。真机日志 09:56 第 2 竿就是
+            #   2/40=5% 直接重抛，白扔一竿（而且那 40 帧分母本身是错的）。
+            #   现在只警告，继续走稳定期 + 咬钩判定。
             if ratio < thresh:
-                self.log("锚点可信度不足（%.0f%% < %.0f%%），本竿放弃重抛", ratio * 100, thresh * 100)
-                return
+                self.log("⚠️ 锚点可信度偏低（%.0f%% < %.0f%%），但锚点已三帧确认，继续使用",
+                         ratio * 100, thresh * 100)
 
         robust = getattr(self.bite_watcher, "mode", "legacy") == "robust"
 

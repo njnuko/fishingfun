@@ -165,12 +165,25 @@ class WowProcess:
 
     @staticmethod
     def park_cursor():
-        """把鼠标停到屏幕最右下角（避开游戏画面，防止悬停提示干扰判断）。"""
+        """把鼠标停到屏幕右下角（避开游戏画面，防止悬停提示干扰判断）。
+
+        ★ v52：原来写成实例方法 def park_cursor():（漏了 self），
+        调用 self.wow_process.park_cursor() 必然 TypeError，又被上层
+        except 吞掉 —— 等于从来没停过鼠标。改成 staticmethod，
+        并且不再静默：失败要把异常抛给调用方记日志。
+        """
+        sw, sh = _screen_size()
+        move_cursor(sw - 1, sh - 1)
+
+    @staticmethod
+    def cursor_is_parked(tol=4):
+        """当前光标是否已经停靠在角落（park 生效校验用）。"""
         try:
             sw, sh = _screen_size()
-            move_cursor(sw - 1, sh - 1)
-        except Exception as e:
-            pass
+            x, y = get_cursor_pos()
+            return abs(x - (sw - 1)) <= tol and abs(y - (sh - 1)) <= tol
+        except Exception:
+            return False
 
     # ---- 逐行对应 WowProcess.cs:176-198 ----
     def _refocus(self, old_position):
