@@ -171,8 +171,12 @@ class SearchBobberFinder:
                 （50 帧量级的真实下沉约每帧 2~8%，绝无单帧 65%）。
         """
         # ★ v57（C）：面积衰减必须逐帧连续，拒绝单帧断崖
+        # ★ v59：_area_hist 元素必须是 (time, area)。此前 tan 路径塞的是裸
+        #   int，这里 `h[0]` 会抛 TypeError，且 sorted 会因混装崩掉。
+        #   两道防御：① 只收二元组；② 裸 int 视为「刚刚发生、面积未知」丢弃。
         hist = [h for h in getattr(self, "_area_hist", [])
-                if time.time() - h[0] <= window]
+                if isinstance(h, (tuple, list)) and len(h) >= 2
+                and time.time() - h[0] <= window]
         if len(hist) < 3:
             return False
         areas = [a for _, a in hist]
@@ -1214,11 +1218,20 @@ class SearchBobberFinder:
         # 而水里杂物 / 别的玩家浮标 / 贴脸物体忽大忽小。
         # 面积比上一次命中跳变超过 AREA_JUMP 倍 → 视为候选不稳，本帧判空，
         # 逼下一帧重新确认（防止锁到错误物体后靠它的 y 抖动误报咬钩）。
-        self._area_hist.append(area)
+        self._area_hist.append((time.time(), int(area)))
         if len(self._area_hist) > 5:
             self._area_hist.pop(0)
         if len(self._area_hist) >= 2:
-            med = sorted(self._area_hist)[len(self._area_hist) // 2]
+            # ★ v59：_area_hist 统一为 (time, area) 元组。
+            #   v58 及以前这里 append 的是裸 int（area），而色差路径
+            #   （_diff_bobber 第 775 行）append 的是 (time, int(size)) 元组。
+            #   同一竿里两条路径都跑过 → 列表里 int / tuple 混装 →
+            #   下一行 sorted() 直接抛
+            #       TypeError: '<' not supported between instances of 'int' and 'tuple'
+            #   真机表现（2026-11-02 13:33~13:34 v58 日志）：每竿锚点锁定后
+            #   约 11 秒、刚好是下沉到 2px 那一帧崩掉，本竿直接作废。
+            #   sorted 必须按 area 分量取中位数，不能拿整个元组排。
+            med = sorted(a for _, a in self._area_hist)[len(self._area_hist) // 2]
             if med > 0 and not (1.0 / AREA_JUMP <= area / float(med) <= AREA_JUMP):
                 self.log("尺寸跳变 %.0f→%.0f（%.2fx），本帧判空", med, area,
                          area / float(med))
